@@ -1,7 +1,7 @@
 
 import os
-import logging
 import asyncio
+import logging
 
 import requests
 import pandas as pd
@@ -12,14 +12,21 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# =========================
+# ==================================
 # ԿԱՐԳԱՎՈՐՈՒՄՆԵՐ
-# =========================
+# ==================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 GATE_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 PAIR = "BTC_USDT"
+CHECK_INTERVAL = 15 * 60  # 15 րոպե
+
+# Բոտին /start ուղարկած օգտատերերը
+subscribed_chats = set()
+
+# Վերջին ազդանշանը՝ կրկնվող ծանուցումները կանխելու համար
+last_signal_by_chat = {}
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -28,9 +35,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =========================
+# ==================================
 # GATE API
-# =========================
+# ==================================
 
 def get_candles(interval="15m", limit=100):
     response = requests.get(
@@ -65,13 +72,13 @@ def get_candles(interval="15m", limit=100):
                 "low": float(low),
                 "open": float(open_price),
             })
-        except (ValueError, TypeError):
+        except (TypeError, ValueError):
             continue
 
     df = pd.DataFrame(rows)
 
     if df.empty:
-        raise ValueError("Մոմերի տվյալները սխալ ձևաչափ ունեն")
+        raise ValueError("Մոմերի տվյալները սխալ են")
 
     df = (
         df.drop_duplicates(subset=["time"])
@@ -85,9 +92,9 @@ def get_candles(interval="15m", limit=100):
     return df
 
 
-# =========================
+# ==================================
 # ՑՈՒՑԱՆԻՇՆԵՐ
-# =========================
+# ==================================
 
 def calculate_indicators(df):
     df = df.copy()
@@ -117,7 +124,6 @@ def calculate_indicators(df):
     ).mean()
 
     rs = avg_gain / avg_loss
-
     df["rsi"] = 100 - (100 / (1 + rs))
 
     df.loc[
@@ -150,9 +156,9 @@ def calculate_indicators(df):
     return df
 
 
-# =========================
+# ==================================
 # ՇՈՒԿԱՅԻ ՎԵՐԼՈՒԾՈՒԹՅՈՒՆ
-# =========================
+# ==================================
 
 def analyze_market():
     df15 = calculate_indicators(get_candles("15m"))
@@ -174,8 +180,8 @@ def analyze_market():
         ema9_1h, ema21_1h, rsi, atr,
     ]
 
-    if not all(pd.notna(x) for x in values):
-        raise ValueError("Ցուցանիշների հաշվարկը չի ավարտվել")
+    if not all(pd.notna(v) for v in values):
+        raise ValueError("Ցուցանիշները պատրաստ չեն")
 
     if price <= 0 or atr <= 0:
         raise ValueError("Գնի կամ ATR-ի արժեքը սխալ է")
@@ -186,51 +192,51 @@ def analyze_market():
     bear1h = ema9_1h < ema21_1h
 
     signal = "NO TRADE"
-    reason = "Հստակ ուղղություն չկա"
-    waiting_for = "Սպասել նոր ազդանշանի"
+    reason = "Ուղղությունները չեն հաստատվում"
+    waiting_for = "Սպասել նոր պայմանների"
 
-    # Հաստատված պայմաններ՝ ըստ այս բոտի կանոնների
-    if bull15 and bull1h and 50 < rsi < 68:
+    # Հաստատված LONG՝ երկու ժամանակահատվածում աճ և RSI > 45
+    if bull15 and bull1h and 45 < rsi < 68:
         signal = "LONG"
-        reason = "15m և 1h ուղղությունները աճող են, RSI-ն հաստատում է"
-        waiting_for = "Սցենարը հաստատված է, բայց ստուգիր ռիսկը"
+        reason = "15m և 1h EMA-ները աճող են, RSI-ն հաստատում է"
+        waiting_for = "Հետևել ռիսկին և շուկայի փոփոխությանը"
 
-    elif bear15 and bear1h and 32 < rsi < 50:
+    # Հաստատված SHORT՝ երկու ժամանակահատվածում անկում
+    elif bear15 and bear1h and 32 < rsi < 55:
         signal = "SHORT"
-        reason = "15m և 1h ուղղությունները նվազող են, RSI-ն հաստատում է"
-        waiting_for = "Սցենարը հաստատված է, բայց ստուգիր ռիսկը"
+        reason = "15m և 1h EMA-ները նվազող են, RSI-ն հաստատում է"
+        waiting_for = "Հետևել ռիսկին և շուկայի փոփոխությանը"
 
-    # Հնարավոր LONG. 1h աճող է, 15m-ում հետքաշում կա
+    # LONG WATCH
     elif bull1h and bear15 and 30 < rsi < 45:
         signal = "LONG WATCH"
-        reason = "1h աճող է, 15m-ում հնարավոր հետքաշում կա"
+        reason = "1h աճող է, 15m-ում հետքաշում կա"
         waiting_for = (
-            "Սպասիր 15m EMA9-ի բարձրանալուն EMA21-ից վերև "
-            "և RSI-ի բարձրանալուն 45-ից վերև"
+            "15m EMA9-ը բարձրանա EMA21-ից վերև, "
+            "իսկ RSI-ն բարձրանա 45-ից վերև"
         )
 
-    # Հնարավոր SHORT. 1h նվազող է, 15m-ում վերականգնում կա
+    # SHORT WATCH
     elif bear1h and bull15 and 55 < rsi < 70:
         signal = "SHORT WATCH"
-        reason = "1h նվազող է, 15m-ում հնարավոր վերականգնում կա"
+        reason = "1h նվազող է, 15m-ում վերականգնում կա"
         waiting_for = (
-            "Սպասիր 15m EMA9-ի իջնելուն EMA21-ից ներքև "
-            "և RSI-ի իջնելուն 55-ից ներքև"
+            "15m EMA9-ը իջնի EMA21-ից ներքև, "
+            "իսկ RSI-ն իջնի 55-ից ներքև"
         )
 
-    # Երկու ուղղություններն էլ աճող են, բայց RSI-ն դեռ թույլ է
-    elif bull15 and bull1h and rsi <= 50:
+    # Աճող ուղղություն, բայց RSI-ն դեռ թույլ է
+    elif bull15 and bull1h and rsi <= 45:
         signal = "LONG WATCH"
-        reason = "Երկու EMA ուղղություններն աճող են, բայց RSI-ն թույլ է"
-        waiting_for = "Սպասիր RSI-ի բարձրանալուն 50-ից վերև"
+        reason = "Երկու ուղղություններն աճող են, RSI-ն դեռ թույլ է"
+        waiting_for = "RSI-ն բարձրանա 45-ից վերև"
 
-    # Երկու ուղղություններն էլ նվազող են, բայց RSI-ն դեռ թույլ է
-    elif bear15 and bear1h and rsi >= 50:
+    # Նվազող ուղղություն, բայց RSI-ն դեռ բարձր է
+    elif bear15 and bear1h and rsi >= 55:
         signal = "SHORT WATCH"
-        reason = "Երկու EMA ուղղություններն նվազող են, բայց RSI-ն բարձր է"
-        waiting_for = "Սպասիր RSI-ի իջնելուն 50-ից ներքև"
+        reason = "Երկու ուղղություններն նվազող են, RSI-ն դեռ բարձր է"
+        waiting_for = "RSI-ն իջնի 55-ից ներքև"
 
-    # Մոտավոր մակարդակներ ATR-ի հիման վրա
     stop_loss = None
     take_profit = None
 
@@ -258,17 +264,61 @@ def analyze_market():
     }
 
 
-# =========================
+# ==================================
+# ՀԱՂՈՐԴԱԳՐՈՒԹՅԱՆ ՏԵՔՍՏ
+# ==================================
+
+def format_signal(result):
+    message = (
+        f"BTC/USDT — {result['signal']}\n"
+        f"Գին՝ {result['price']:.2f} USDT\n"
+        f"RSI (15m)՝ {result['rsi']:.2f}\n"
+        f"EMA 9/21 (15m)՝ "
+        f"{result['ema9_15']:.2f} / "
+        f"{result['ema21_15']:.2f}\n"
+        f"EMA 9/21 (1h)՝ "
+        f"{result['ema9_1h']:.2f} / "
+        f"{result['ema21_1h']:.2f}\n"
+        f"ATR (15m)՝ {result['atr']:.2f}\n\n"
+        f"Պատճառ՝ {result['reason']}\n"
+        f"Հաջորդ պայմանը՝ {result['waiting_for']}\n"
+    )
+
+    if result["signal"] in ("LONG", "SHORT"):
+        message += (
+            f"\nՆախնական Stop Loss՝ "
+            f"{result['stop_loss']:.2f}\n"
+            f"Նախնական Take Profit՝ "
+            f"{result['take_profit']:.2f}\n"
+            "\nՍտուգիր ռիսկը՝ գործարքից առաջ։"
+        )
+
+    elif result["signal"] in ("LONG WATCH", "SHORT WATCH"):
+        message += (
+            "\nՍա դիտարկման ազդանշան է, "
+            "ոչ թե գործարքի հաստատում։"
+        )
+
+    return message
+
+
+# ==================================
 # TELEGRAM ՀՐԱՄԱՆՆԵՐ
-# =========================
+# ==================================
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text(
+    chat_id = update.effective_chat.id
+    subscribed_chats.add(chat_id)
+
+    await update.effective_message.reply_text(
         "Bot is working!\n\n"
-        "BTC/USDT ազդանշանի համար գրիր /signal"
+        "Ավտոմատ BTC/USDT ստուգումը միացված է։\n"
+        "Ստուգում՝ ամեն 15 րոպեն մեկ։\n"
+        "LONG կամ SHORT պայմանների դեպքում կստանաս ծանուցում։\n\n"
+        "Ձեռքով ստուգելու համար գրիր /signal"
     )
 
 
@@ -276,55 +326,91 @@ async def signal_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text(
+    chat_id = update.effective_chat.id
+    subscribed_chats.add(chat_id)
+
+    await update.effective_message.reply_text(
         "Ստուգում եմ BTC/USDT շուկան..."
     )
 
     try:
         result = await asyncio.to_thread(analyze_market)
 
-        message = (
-            f"BTC/USDT — {result['signal']}\n"
-            f"Գին՝ {result['price']:.2f} USDT\n"
-            f"RSI (15m)՝ {result['rsi']:.2f}\n"
-            f"EMA 9/21 (15m)՝ "
-            f"{result['ema9_15']:.2f} / "
-            f"{result['ema21_15']:.2f}\n"
-            f"EMA 9/21 (1h)՝ "
-            f"{result['ema9_1h']:.2f} / "
-            f"{result['ema21_1h']:.2f}\n"
-            f"ATR (15m)՝ {result['atr']:.2f}\n\n"
-            f"Պատճառ՝ {result['reason']}\n"
-            f"Հաջորդ պայմանը՝ {result['waiting_for']}\n"
+        # Հիշում ենք ձեռքով ստուգված վիճակը,
+        # որպեսզի նույն ազդանշանը անմիջապես չկրկնվի։
+        last_signal_by_chat[chat_id] = result["signal"]
+
+        await update.effective_message.reply_text(
+            format_signal(result)
         )
-
-        if result["signal"] in ("LONG", "SHORT"):
-            message += (
-                f"\nStop Loss՝ {result['stop_loss']:.2f}\n"
-                f"Take Profit՝ {result['take_profit']:.2f}\n"
-            )
-        elif result["signal"] in ("LONG WATCH", "SHORT WATCH"):
-            message += (
-                "\nՍա դիտարկման ազդանշան է, ոչ թե մուտքի հաստատում։\n"
-                "Մակարդակները մի՛ օգտագործիր որպես պատրաստի պատվեր։"
-            )
-        else:
-            message += "\nԱյս պահին մուտքի հստակ պայմաններ չկան։"
-
-        await update.message.reply_text(message)
 
     except Exception:
         logger.exception("Signal-ի հաշվարկը ձախողվեց")
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Տվյալների ստացման կամ հաշվարկի սխալ։ "
             "Ստուգիր Fadehost-ի Logs-ը։"
         )
 
 
-# =========================
+# ==================================
+# ԱՎՏՈՄԱՏ ՍՏՈՒԳՈՒՄ
+# ==================================
+
+async def periodic_alerts(app):
+    # Սպասում ենք, որ բոտը լիովին գործարկվի։
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            if subscribed_chats:
+                result = await asyncio.to_thread(analyze_market)
+                signal = result["signal"]
+
+                for chat_id in list(subscribed_chats):
+                    previous = last_signal_by_chat.get(chat_id)
+
+                    # Ծանուցում միայն նոր LONG կամ SHORT-ի դեպքում։
+                    if (
+                        signal in ("LONG", "SHORT")
+                        and signal != previous
+                    ):
+                        try:
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    "🔔 ԱՎՏՈՄԱՏ ԱԶԴԱՆՇԱՆ\n\n"
+                                    + format_signal(result)
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Ծանուցումը չուղարկվեց chat_id=%s",
+                                chat_id,
+                            )
+
+                    # Հիշում ենք վերջին վիճակը։
+                    last_signal_by_chat[chat_id] = signal
+
+                logger.info(
+                    "Ավտոմատ ստուգումն ավարտվեց. signal=%s",
+                    signal,
+                )
+
+        except Exception:
+            logger.exception("Ավտոմատ ստուգման սխալ")
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def post_init(app):
+    # Սկսում ենք ֆոնային ստուգումը՝ առանց հավելյալ գրադարանի։
+    app.create_task(periodic_alerts(app))
+
+
+# ==================================
 # ՄԵԿՆԱՐԿ
-# =========================
+# ==================================
 
 def main():
     if not TOKEN:
@@ -332,7 +418,12 @@ def main():
             "TELEGRAM_BOT_TOKEN փոփոխականը կարգավորված չէ"
         )
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("signal", signal_command))
