@@ -25,38 +25,32 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
 
 # =========================
-# GATE API - ՄՈՄԵՐԻ ՏՎՅԱԼՆԵՐ
+# GATE API
 # =========================
 
 def get_candles(interval="15m", limit=100):
-    params = {
-        "currency_pair": PAIR,
-        "interval": interval,
-        "limit": limit,
-    }
-
     response = requests.get(
         GATE_URL,
-        params=params,
-        timeout=15,
+        params={
+            "currency_pair": PAIR,
+            "interval": interval,
+            "limit": limit,
+        },
+        timeout=20,
     )
-
     response.raise_for_status()
     data = response.json()
 
     if not isinstance(data, list) or not data:
-        raise ValueError("Gate API-ն դատարկ տվյալներ է վերադարձրել")
+        raise ValueError("Gate-ը տվյալներ չի վերադարձրել")
 
     rows = []
 
     for candle in data:
-        # Gate-ի պատասխանը կարող է ունենալ 6-ից ավելի դաշտ։
-        # Մեզ անհրաժեշտ են առաջին 6 դաշտերը։
         if not isinstance(candle, (list, tuple)) or len(candle) < 6:
             continue
 
@@ -71,25 +65,28 @@ def get_candles(interval="15m", limit=100):
                 "low": float(low),
                 "open": float(open_price),
             })
-        except (TypeError, ValueError):
+        except (ValueError, TypeError):
             continue
-
-    if len(rows) < 30:
-        raise ValueError(
-            f"Բավարար մոմեր չկան․ ստացվել է {len(rows)}"
-        )
 
     df = pd.DataFrame(rows)
 
-    # Հին մոմերը՝ առաջինը, նորերը՝ վերջում։
-    df = df.drop_duplicates(subset=["time"])
-    df = df.sort_values("time").reset_index(drop=True)
+    if df.empty:
+        raise ValueError("Մոմերի տվյալները սխալ ձևաչափ ունեն")
+
+    df = (
+        df.drop_duplicates(subset=["time"])
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+
+    if len(df) < 30:
+        raise ValueError("Բավարար քանակով մոմեր չկան")
 
     return df
 
 
 # =========================
-# ՏԵԽՆԻԿԱԿԱՆ ՑՈՒՑԱՆԻՇՆԵՐ
+# ՑՈՒՑԱՆԻՇՆԵՐ
 # =========================
 
 def calculate_indicators(df):
@@ -104,7 +101,6 @@ def calculate_indicators(df):
     ).mean()
 
     delta = df["close"].diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -120,13 +116,10 @@ def calculate_indicators(df):
         adjust=False,
     ).mean()
 
-    relative_strength = avg_gain / avg_loss
+    rs = avg_gain / avg_loss
 
-    df["rsi"] = 100 - (
-        100 / (1 + relative_strength)
-    )
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    # RSI-ի հատուկ դեպքեր
     df.loc[
         (avg_loss == 0) & (avg_gain > 0), "rsi"
     ] = 100
@@ -136,11 +129,9 @@ def calculate_indicators(df):
     ] = 50
 
     high_low = df["high"] - df["low"]
-
     high_close = (
         df["high"] - df["close"].shift(1)
     ).abs()
-
     low_close = (
         df["low"] - df["close"].shift(1)
     ).abs()
@@ -160,15 +151,12 @@ def calculate_indicators(df):
 
 
 # =========================
-# ԱԶԴԱՆՇԱՆԻ ՀԱՇՎԱՐԿ
+# ՇՈՒԿԱՅԻ ՎԵՐԼՈՒԾՈՒԹՅՈՒՆ
 # =========================
 
 def analyze_market():
-    candles_15m = get_candles("15m")
-    candles_1h = get_candles("1h")
-
-    df15 = calculate_indicators(candles_15m)
-    df1h = calculate_indicators(candles_1h)
+    df15 = calculate_indicators(get_candles("15m"))
+    df1h = calculate_indicators(get_candles("1h"))
 
     last15 = df15.iloc[-1]
     last1h = df1h.iloc[-1]
@@ -186,45 +174,73 @@ def analyze_market():
         ema9_1h, ema21_1h, rsi, atr,
     ]
 
-    if not all(pd.notna(v) for v in values):
-        raise ValueError("Ցուցանիշները դեռ պատրաստ չեն")
+    if not all(pd.notna(x) for x in values):
+        raise ValueError("Ցուցանիշների հաշվարկը չի ավարտվել")
 
     if price <= 0 or atr <= 0:
         raise ValueError("Գնի կամ ATR-ի արժեքը սխալ է")
 
+    bull15 = ema9_15 > ema21_15
+    bear15 = ema9_15 < ema21_15
+    bull1h = ema9_1h > ema21_1h
+    bear1h = ema9_1h < ema21_1h
+
     signal = "NO TRADE"
-    reason = "Ժամանակահատվածների ուղղությունները չեն հաստատվում"
+    reason = "Հստակ ուղղություն չկա"
+    waiting_for = "Սպասել նոր ազդանշանի"
 
-    # LONG՝ երկու ժամանակահատվածներում աճող ուղղություն
-    if (
-        ema9_15 > ema21_15
-        and ema9_1h > ema21_1h
-        and 50 < rsi < 68
-    ):
+    # Հաստատված պայմաններ՝ ըստ այս բոտի կանոնների
+    if bull15 and bull1h and 50 < rsi < 68:
         signal = "LONG"
-        reason = "EMA-ները աճող են, RSI-ն հաստատում է շարժումը"
+        reason = "15m և 1h ուղղությունները աճող են, RSI-ն հաստատում է"
+        waiting_for = "Սցենարը հաստատված է, բայց ստուգիր ռիսկը"
 
-    # SHORT՝ երկու ժամանակահատվածներում նվազող ուղղություն
-    elif (
-        ema9_15 < ema21_15
-        and ema9_1h < ema21_1h
-        and 32 < rsi < 50
-    ):
+    elif bear15 and bear1h and 32 < rsi < 50:
         signal = "SHORT"
-        reason = "EMA-ները նվազող են, RSI-ն հաստատում է շարժումը"
+        reason = "15m և 1h ուղղությունները նվազող են, RSI-ն հաստատում է"
+        waiting_for = "Սցենարը հաստատված է, բայց ստուգիր ռիսկը"
 
-    # Նախնական մակարդակներ՝ ATR-ի հիման վրա
+    # Հնարավոր LONG. 1h աճող է, 15m-ում հետքաշում կա
+    elif bull1h and bear15 and 30 < rsi < 45:
+        signal = "LONG WATCH"
+        reason = "1h աճող է, 15m-ում հնարավոր հետքաշում կա"
+        waiting_for = (
+            "Սպասիր 15m EMA9-ի բարձրանալուն EMA21-ից վերև "
+            "և RSI-ի բարձրանալուն 45-ից վերև"
+        )
+
+    # Հնարավոր SHORT. 1h նվազող է, 15m-ում վերականգնում կա
+    elif bear1h and bull15 and 55 < rsi < 70:
+        signal = "SHORT WATCH"
+        reason = "1h նվազող է, 15m-ում հնարավոր վերականգնում կա"
+        waiting_for = (
+            "Սպասիր 15m EMA9-ի իջնելուն EMA21-ից ներքև "
+            "և RSI-ի իջնելուն 55-ից ներքև"
+        )
+
+    # Երկու ուղղություններն էլ աճող են, բայց RSI-ն դեռ թույլ է
+    elif bull15 and bull1h and rsi <= 50:
+        signal = "LONG WATCH"
+        reason = "Երկու EMA ուղղություններն աճող են, բայց RSI-ն թույլ է"
+        waiting_for = "Սպասիր RSI-ի բարձրանալուն 50-ից վերև"
+
+    # Երկու ուղղություններն էլ նվազող են, բայց RSI-ն դեռ թույլ է
+    elif bear15 and bear1h and rsi >= 50:
+        signal = "SHORT WATCH"
+        reason = "Երկու EMA ուղղություններն նվազող են, բայց RSI-ն բարձր է"
+        waiting_for = "Սպասիր RSI-ի իջնելուն 50-ից ներքև"
+
+    # Մոտավոր մակարդակներ ATR-ի հիման վրա
+    stop_loss = None
+    take_profit = None
+
     if signal == "LONG":
-        stop_loss = price - (1.5 * atr)
-        take_profit = price + (2 * atr)
+        stop_loss = price - 1.5 * atr
+        take_profit = price + 2 * atr
 
     elif signal == "SHORT":
-        stop_loss = price + (1.5 * atr)
-        take_profit = price - (2 * atr)
-
-    else:
-        stop_loss = None
-        take_profit = None
+        stop_loss = price + 1.5 * atr
+        take_profit = price - 2 * atr
 
     return {
         "signal": signal,
@@ -238,6 +254,7 @@ def analyze_market():
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "reason": reason,
+        "waiting_for": waiting_for,
     }
 
 
@@ -249,7 +266,10 @@ async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text("Bot is working!")
+    await update.message.reply_text(
+        "Bot is working!\n\n"
+        "BTC/USDT ազդանշանի համար գրիր /signal"
+    )
 
 
 async def signal_command(
@@ -273,20 +293,23 @@ async def signal_command(
             f"EMA 9/21 (1h)՝ "
             f"{result['ema9_1h']:.2f} / "
             f"{result['ema21_1h']:.2f}\n"
-            f"ATR (15m)՝ {result['atr']:.2f}\n"
+            f"ATR (15m)՝ {result['atr']:.2f}\n\n"
             f"Պատճառ՝ {result['reason']}\n"
+            f"Հաջորդ պայմանը՝ {result['waiting_for']}\n"
         )
 
-        if result["signal"] != "NO TRADE":
+        if result["signal"] in ("LONG", "SHORT"):
             message += (
-                f"Stop Loss՝ {result['stop_loss']:.2f}\n"
+                f"\nStop Loss՝ {result['stop_loss']:.2f}\n"
                 f"Take Profit՝ {result['take_profit']:.2f}\n"
             )
-        else:
+        elif result["signal"] in ("LONG WATCH", "SHORT WATCH"):
             message += (
-                "Մուտքի պայմանները հաստատված չեն։\n"
-                "Մի՛ բացիր գործարք միայն այս ազդանշանի հիման վրա։"
+                "\nՍա դիտարկման ազդանշան է, ոչ թե մուտքի հաստատում։\n"
+                "Մակարդակները մի՛ օգտագործիր որպես պատրաստի պատվեր։"
             )
+        else:
+            message += "\nԱյս պահին մուտքի հստակ պայմաններ չկան։"
 
         await update.message.reply_text(message)
 
@@ -294,13 +317,13 @@ async def signal_command(
         logger.exception("Signal-ի հաշվարկը ձախողվեց")
 
         await update.message.reply_text(
-            "Տվյալների ստացման սխալ։ "
+            "Տվյալների ստացման կամ հաշվարկի սխալ։ "
             "Ստուգիր Fadehost-ի Logs-ը։"
         )
 
 
 # =========================
-# ԳՈՐԾԱՐԿՈՒՄ
+# ՄԵԿՆԱՐԿ
 # =========================
 
 def main():
@@ -320,4 +343,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
