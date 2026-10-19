@@ -1,9 +1,10 @@
 
 import os
 import logging
+import asyncio
+
 import requests
 import pandas as pd
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -11,48 +12,87 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# =========================
+# ԿԱՐԳԱՎՈՐՈՒՄՆԵՐ
+# =========================
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SYMBOL = "BTC_USDT"
-BASE_URL = "https://api.gateio.ws/api/v4"
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+GATE_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
+PAIR = "BTC_USDT"
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def get_candles(interval="15m", limit=150):
+# =========================
+# GATE API - ՄՈՄԵՐԻ ՏՎՅԱԼՆԵՐ
+# =========================
+
+def get_candles(interval="15m", limit=100):
+    params = {
+        "currency_pair": PAIR,
+        "interval": interval,
+        "limit": limit,
+    }
+
     response = requests.get(
-        f"{BASE_URL}/spot/candlesticks",
-        params={
-            "currency_pair": SYMBOL,
-            "interval": interval,
-            "limit": limit,
-        },
+        GATE_URL,
+        params=params,
         timeout=15,
     )
+
     response.raise_for_status()
+    data = response.json()
 
-    df = pd.DataFrame(
-        response.json(),
-        columns=[
-            "time", "volume", "close",
-            "high", "low", "open"
-        ],
-    )
+    if not isinstance(data, list) or not data:
+        raise ValueError("Gate API-ն դատարկ տվյալներ է վերադարձրել")
 
-    for col in ["close", "high", "low", "open"]:
-        df[col] = pd.to_numeric(df[col], errors="raise")
+    rows = []
 
+    for candle in data:
+        # Gate-ի պատասխանը կարող է ունենալ 6-ից ավելի դաշտ։
+        # Մեզ անհրաժեշտ են առաջին 6 դաշտերը։
+        if not isinstance(candle, (list, tuple)) or len(candle) < 6:
+            continue
+
+        try:
+            timestamp, volume, close, high, low, open_price = candle[:6]
+
+            rows.append({
+                "time": int(timestamp),
+                "volume": float(volume),
+                "close": float(close),
+                "high": float(high),
+                "low": float(low),
+                "open": float(open_price),
+            })
+        except (TypeError, ValueError):
+            continue
+
+    if len(rows) < 30:
+        raise ValueError(
+            f"Բավարար մոմեր չկան․ ստացվել է {len(rows)}"
+        )
+
+    df = pd.DataFrame(rows)
+
+    # Հին մոմերը՝ առաջինը, նորերը՝ վերջում։
+    df = df.drop_duplicates(subset=["time"])
     df = df.sort_values("time").reset_index(drop=True)
 
-    # Վերջին մոմը կարող է դեռ չփակված լինել։
-    # Վերլուծության համար օգտագործում ենք փակված մոմերը։
-    if len(df) > 1:
-        df = df.iloc[:-1].copy()
-
-    return df.reset_index(drop=True)
+    return df
 
 
-def add_indicators(df):
+# =========================
+# ՏԵԽՆԻԿԱԿԱՆ ՑՈՒՑԱՆԻՇՆԵՐ
+# =========================
+
+def calculate_indicators(df):
     df = df.copy()
 
     df["ema9"] = df["close"].ewm(
@@ -64,6 +104,7 @@ def add_indicators(df):
     ).mean()
 
     delta = df["close"].diff()
+
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -79,17 +120,33 @@ def add_indicators(df):
         adjust=False,
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["rsi"] = 100 - (100 / (1 + rs))
+    relative_strength = avg_gain / avg_loss
 
-    previous_close = df["close"].shift(1)
+    df["rsi"] = 100 - (
+        100 / (1 + relative_strength)
+    )
+
+    # RSI-ի հատուկ դեպքեր
+    df.loc[
+        (avg_loss == 0) & (avg_gain > 0), "rsi"
+    ] = 100
+
+    df.loc[
+        (avg_loss == 0) & (avg_gain == 0), "rsi"
+    ] = 50
+
+    high_low = df["high"] - df["low"]
+
+    high_close = (
+        df["high"] - df["close"].shift(1)
+    ).abs()
+
+    low_close = (
+        df["low"] - df["close"].shift(1)
+    ).abs()
 
     true_range = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs(),
-        ],
+        [high_low, high_close, low_close],
         axis=1,
     ).max(axis=1)
 
@@ -102,159 +159,165 @@ def add_indicators(df):
     return df
 
 
-def make_plan(direction, price, ema9, ema21, atr):
-    # Մուտքի մոտավոր գոտի՝ EMA9-ի շուրջ։
-    # Այն պատվեր տեղադրելու հրահանգ չէ։
-    buffer = atr * 0.15
-    entry_low = ema9 - buffer
-    entry_high = ema9 + buffer
+# =========================
+# ԱԶԴԱՆՇԱՆԻ ՀԱՇՎԱՐԿ
+# =========================
 
-    # LONG-ի համար սպասում ենք, որ գինը
-    # վերադարձից հետո հաստատի աճող շարժումը։
-    # SHORT-ի համար՝ նվազող շարժումը։
+def analyze_market():
+    candles_15m = get_candles("15m")
+    candles_1h = get_candles("1h")
 
-    entry = (entry_low + entry_high) / 2
+    df15 = calculate_indicators(candles_15m)
+    df1h = calculate_indicators(candles_1h)
 
-    if direction == "LONG":
-        stop = entry - 1.2 * atr
-        risk = entry - stop
-        tp1 = entry + 1.5 * risk
-        tp2 = entry + 2.5 * risk
-        confirmation = (
-            "Գինը պահպանում է մուտքի գոտին, "
-            "15m մոմը փակում է EMA9-ից վեր, "
-            "RSI-ն գերադասելի է 50-ից բարձր։"
-        )
-    else:
-        stop = entry + 1.2 * atr
-        risk = stop - entry
-        tp1 = entry - 1.5 * risk
-        tp2 = entry - 2.5 * risk
-        confirmation = (
-            "Գինը մերժվում է մուտքի գոտուց, "
-            "15m մոմը փակում է EMA9-ից ներքև, "
-            "RSI-ն գերադասելի է 50-ից ցածր։"
-        )
+    last15 = df15.iloc[-1]
+    last1h = df1h.iloc[-1]
 
-    return (
-        f"{direction} սցենար\n"
-        f"Մուտքի գոտի՝ {entry_low:,.2f} – "
-        f"{entry_high:,.2f}\n"
-        f"SL՝ {stop:,.2f}\n"
-        f"TP1՝ {tp1:,.2f}\n"
-        f"TP2՝ {tp2:,.2f}\n"
-        f"Ռիսկ/շահույթ՝ 1:1.5 և 1:2.5\n"
-        f"Հաստատում՝ {confirmation}"
-    )
+    price = float(last15["close"])
+    ema9_15 = float(last15["ema9"])
+    ema21_15 = float(last15["ema21"])
+    ema9_1h = float(last1h["ema9"])
+    ema21_1h = float(last1h["ema21"])
+    rsi = float(last15["rsi"])
+    atr = float(last15["atr"])
 
+    values = [
+        price, ema9_15, ema21_15,
+        ema9_1h, ema21_1h, rsi, atr,
+    ]
 
-def calculate_signal():
-    df15 = add_indicators(get_candles("15m"))
-    df1h = add_indicators(get_candles("1h"))
+    if not all(pd.notna(v) for v in values):
+        raise ValueError("Ցուցանիշները դեռ պատրաստ չեն")
 
-    last = df15.iloc[-1]
-    hour = df1h.iloc[-1]
+    if price <= 0 or atr <= 0:
+        raise ValueError("Գնի կամ ATR-ի արժեքը սխալ է")
 
-    price = float(last["close"])
-    rsi = float(last["rsi"])
-    ema9 = float(last["ema9"])
-    ema21 = float(last["ema21"])
-    ema9h = float(hour["ema9"])
-    ema21h = float(hour["ema21"])
-    atr = float(last["atr"])
+    signal = "NO TRADE"
+    reason = "Ժամանակահատվածների ուղղությունները չեն հաստատվում"
 
-    if pd.isna(rsi) or pd.isna(atr) or atr <= 0:
-        return "Բավարար տվյալներ չկան։ Փորձիր ավելի ուշ։"
+    # LONG՝ երկու ժամանակահատվածներում աճող ուղղություն
+    if (
+        ema9_15 > ema21_15
+        and ema9_1h > ema21_1h
+        and 50 < rsi < 68
+    ):
+        signal = "LONG"
+        reason = "EMA-ները աճող են, RSI-ն հաստատում է շարժումը"
 
-    long_ok = (
-        ema9 > ema21
-        and ema9h > ema21h
-        and 50 <= rsi <= 68
-        and price > ema9
-    )
+    # SHORT՝ երկու ժամանակահատվածներում նվազող ուղղություն
+    elif (
+        ema9_15 < ema21_15
+        and ema9_1h < ema21_1h
+        and 32 < rsi < 50
+    ):
+        signal = "SHORT"
+        reason = "EMA-ները նվազող են, RSI-ն հաստատում է շարժումը"
 
-    short_ok = (
-        ema9 < ema21
-        and ema9h < ema21h
-        and 32 <= rsi <= 50
-        and price < ema9
-    )
+    # Նախնական մակարդակներ՝ ATR-ի հիման վրա
+    if signal == "LONG":
+        stop_loss = price - (1.5 * atr)
+        take_profit = price + (2 * atr)
 
-    text = (
-        f"BTC/USDT\n"
-        f"Գին՝ {price:,.2f} USDT\n"
-        f"RSI (15m)՝ {rsi:.1f}\n"
-        f"EMA 9/21 (15m)՝ {ema9:,.2f} / "
-        f"{ema21:,.2f}\n"
-        f"EMA 9/21 (1h)՝ {ema9h:,.2f} / "
-        f"{ema21h:,.2f}\n"
-        f"ATR (15m)՝ {atr:,.2f}\n\n"
-    )
-
-    if long_ok:
-        text += "ԱԶԴԱՆՇԱՆ՝ LONG 🟢\n\n"
-        text += make_plan("LONG", price, ema9, ema21, atr)
-
-    elif short_ok:
-        text += "ԱԶԴԱՆՇԱՆ՝ SHORT 🔴\n\n"
-        text += make_plan("SHORT", price, ema9, ema21, atr)
+    elif signal == "SHORT":
+        stop_loss = price + (1.5 * atr)
+        take_profit = price - (2 * atr)
 
     else:
-        text += (
-            "ԱԶԴԱՆՇԱՆ՝ NO TRADE ⚪\n"
-            "Մուտքի հաստատում դեռ չկա։\n\n"
-            "LONG-ի պայմանական սցենար՝\n"
-        )
-        text += make_plan("LONG", price, ema9, ema21, atr)
-        text += "\n\nSHORT-ի պայմանական սցենար՝\n"
-        text += make_plan("SHORT", price, ema9, ema21, atr)
+        stop_loss = None
+        take_profit = None
 
-    text += (
-        "\n\n⚠️ Մակարդակները ATR/EMA-ի հիման վրա "
-        "հաշվարկային են, ոչ երաշխավորված։ "
-        "Սպասիր հաստատման։ Բոտը գործարք չի բացում։"
-    )
+    return {
+        "signal": signal,
+        "price": price,
+        "rsi": rsi,
+        "ema9_15": ema9_15,
+        "ema21_15": ema21_15,
+        "ema9_1h": ema9_1h,
+        "ema21_1h": ema21_1h,
+        "atr": atr,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "reason": reason,
+    }
 
-    return text
+
+# =========================
+# TELEGRAM ՀՐԱՄԱՆՆԵՐ
+# =========================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text("Bot is working!")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.message.reply_text(
-        "Բոտը աշխատում է։ ✅\n\n"
-        "/signal — BTC/USDT վերլուծություն\n"
-        "/start — օգնություն"
-    )
-
-
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = await update.message.reply_text(
-        "Ստուգում եմ շուկան..."
+        "Ստուգում եմ BTC/USDT շուկան..."
     )
 
     try:
-        result = calculate_signal()
-        await message.edit_text(result)
-    except Exception:
-        logging.exception("Signal error")
-        await message.edit_text(
-            "Տվյալների ստացման սխալ։ "
-            "Ստուգիր ինտերնետը և փորձիր կրկին։"
+        result = await asyncio.to_thread(analyze_market)
+
+        message = (
+            f"BTC/USDT — {result['signal']}\n"
+            f"Գին՝ {result['price']:.2f} USDT\n"
+            f"RSI (15m)՝ {result['rsi']:.2f}\n"
+            f"EMA 9/21 (15m)՝ "
+            f"{result['ema9_15']:.2f} / "
+            f"{result['ema21_15']:.2f}\n"
+            f"EMA 9/21 (1h)՝ "
+            f"{result['ema9_1h']:.2f} / "
+            f"{result['ema21_1h']:.2f}\n"
+            f"ATR (15m)՝ {result['atr']:.2f}\n"
+            f"Պատճառ՝ {result['reason']}\n"
         )
 
+        if result["signal"] != "NO TRADE":
+            message += (
+                f"Stop Loss՝ {result['stop_loss']:.2f}\n"
+                f"Take Profit՝ {result['take_profit']:.2f}\n"
+            )
+        else:
+            message += (
+                "Մուտքի պայմանները հաստատված չեն։\n"
+                "Մի՛ բացիր գործարք միայն այս ազդանշանի հիման վրա։"
+            )
+
+        await update.message.reply_text(message)
+
+    except Exception:
+        logger.exception("Signal-ի հաշվարկը ձախողվեց")
+
+        await update.message.reply_text(
+            "Տվյալների ստացման սխալ։ "
+            "Ստուգիր Fadehost-ի Logs-ը։"
+        )
+
+
+# =========================
+# ԳՈՐԾԱՐԿՈՒՄ
+# =========================
 
 def main():
     if not TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN-ը բացակայում է Replit Secrets-ից։"
+            "TELEGRAM_BOT_TOKEN փոփոխականը կարգավորված չէ"
         )
 
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", signal))
 
-    print("Bot is running...")
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("signal", signal_command))
+
+    logger.info("Բոտը գործարկվում է...")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
