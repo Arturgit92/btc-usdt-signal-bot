@@ -3,7 +3,6 @@ import os
 import time
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 import requests
 import pandas as pd
@@ -15,32 +14,25 @@ from telegram.ext import (
 )
 
 # ==================================================
-# ԿԱՐԳԱՎՈՐՈՒՄՆԵՐ
+# SETTINGS
 # ==================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Gate.io USDT Futures
 GATE_URL = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
 CONTRACT = "BTC_USDT"
 
-# Կոմիսիա՝ ՄԵԿ կողմի համար։
-# 0.0005 = 0.05%։ Փոխիր ըստ քո իրական Gate fee tier-ի։
+# One-side futures fee. 0.0005 = 0.05%.
+# Set FUTURES_FEE_RATE in Fadehost to your actual rate.
 FEE_RATE = float(os.getenv("FUTURES_FEE_RATE", "0.0005"))
 
-# SL = ATR * այս գործակիցը
 ATR_MULTIPLIER = 1.5
-
-# TP-ները զուտ 2R և 3R են՝ երկու կողմի
-# կոմիսիան հաշվելուց հետո։
 TP1_R = 2.0
 TP2_R = 3.0
-
-# Բեքթեստում դիրքի 50%-ը փակվում է TP1-ում,
-# մնացած 50%-ը՝ TP2-ում։
 TP1_CLOSE_PERCENT = 0.50
 
 POLL_SECONDS = 60
+
 CANDLE_SECONDS = {
     "15m": 900,
     "1h": 3600,
@@ -52,38 +44,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Սրանք հիշվում են միայն ծրագրի աշխատանքի ընթացքում։
 CHAT_IDS = set()
 LAST_ALERT_CANDLE = None
 
 
 # ==================================================
-# GATE FUTURES ՏՎՅԱԼՆԵՐ
+# GATE FUTURES DATA
 # ==================================================
 
 def request_candles(interval, limit=200, start=None, end=None):
     params = {
         "contract": CONTRACT,
         "interval": interval,
-        "limit": min(int(limit), 1000),
     }
 
-    if start is not None:
-        params["from"] = int(start)
-
-    if end is not None:
-        params["to"] = int(end)
+    # IMPORTANT:
+    # Gate historical requests use from/to.
+    # Do not send limit with from/to.
+    if start is not None or end is not None:
+        if start is not None:
+            params["from"] = int(start)
+        if end is not None:
+            params["to"] = int(end)
+    else:
+        params["limit"] = min(int(limit), 1000)
 
     response = requests.get(
         GATE_URL,
         params=params,
-        timeout=15,
+        timeout=20,
     )
-    response.raise_for_status()
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Gate API error {response.status_code}: "
+            f"{response.text[:400]}"
+        )
 
     rows = response.json()
+
     if not isinstance(rows, list):
-        raise ValueError("Gate-ը անսպասելի պատասխան է վերադարձրել")
+        raise ValueError("Gate API returned unexpected data")
 
     parsed = []
 
@@ -104,7 +105,7 @@ def request_candles(interval, limit=200, start=None, end=None):
         return pd.DataFrame(
             columns=[
                 "time", "open", "high",
-                "low", "close", "volume"
+                "low", "close", "volume",
             ]
         )
 
@@ -114,7 +115,6 @@ def request_candles(interval, limit=200, start=None, end=None):
 
 
 def get_closed_candles(interval, limit=200):
-    """Վերադարձնում է միայն փակված մոմերը։"""
     df = request_candles(interval, limit=limit)
 
     if df.empty:
@@ -123,14 +123,14 @@ def get_closed_candles(interval, limit=200):
     now = int(time.time())
     seconds = CANDLE_SECONDS[interval]
 
-    # Բաց մոմը չենք օգտագործում ազդանշանի համար։
+    # Exclude the currently forming candle.
     df = df[df["time"] + seconds <= now]
 
     return df.reset_index(drop=True)
 
 
 def fetch_history(interval, days):
-    """Պատմական մոմերի ներբեռնում՝ էջերով։"""
+    """Download historical candles in time chunks."""
     seconds = CANDLE_SECONDS[interval]
     now = int(time.time())
 
@@ -146,7 +146,6 @@ def fetch_history(interval, days):
 
         df = request_candles(
             interval,
-            limit=1000,
             start=cursor,
             end=chunk_end,
         )
@@ -161,16 +160,20 @@ def fetch_history(interval, days):
             & (df["time"] + seconds <= now)
         ]
 
-        if not df.empty:
-            all_frames.append(df)
-            latest_time = int(df["time"].max())
-            cursor = latest_time + seconds
-        else:
+        if df.empty:
             cursor = chunk_end + seconds
+            continue
 
-        # Պաշտպանություն՝ անվերջ ցիկլից։
-        if cursor <= start_time:
-            break
+        all_frames.append(df)
+
+        latest_time = int(df["time"].max())
+        next_cursor = latest_time + seconds
+
+        # Prevent getting stuck if the API returns old candles.
+        if next_cursor <= cursor:
+            cursor = chunk_end + seconds
+        else:
+            cursor = next_cursor
 
         time.sleep(0.08)
 
@@ -178,7 +181,7 @@ def fetch_history(interval, days):
         return pd.DataFrame(
             columns=[
                 "time", "open", "high",
-                "low", "close", "volume"
+                "low", "close", "volume",
             ]
         )
 
@@ -190,7 +193,7 @@ def fetch_history(interval, days):
 
 
 # ==================================================
-# ՑՈՒՑԻՉՆԵՐ
+# INDICATORS
 # ==================================================
 
 def indicators(df):
@@ -205,7 +208,6 @@ def indicators(df):
     ).mean()
 
     delta = df["close"].diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -224,7 +226,6 @@ def indicators(df):
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # RSI-ի եզրային դեպքեր
     df.loc[
         (avg_loss == 0) & (avg_gain > 0), "rsi"
     ] = 100
@@ -253,12 +254,10 @@ def indicators(df):
 
 
 # ==================================================
-# ԱԶԴԱՆՇԱՆԻ ՊԱՅՄԱՆՆԵՐ
+# SIGNAL RULES
 # ==================================================
 
 def determine_signal(prev, cur, hour):
-    """Վերադարձնում է LONG, SHORT կամ NO TRADE։"""
-
     values = [
         prev.get("ema9"),
         prev.get("ema21"),
@@ -314,22 +313,10 @@ def determine_signal(prev, cur, hour):
 
 
 # ==================================================
-# SL, TP1, TP2՝ ԿՈՄԻՍԻԱՆ ՀԱՇՎԵԼՈՎ
+# ATR STOP LOSS AND NET R TARGETS
 # ==================================================
 
 def calculate_levels(signal, entry, atr):
-    """
-    SL-ը ATR-ով է։
-
-    R = մեկ միավորի զուտ կորուստը SL-ի դեպքում,
-    ներառյալ մուտքի և ելքի կոմիսիան։
-
-    TP1 = զուտ +2R
-    TP2 = զուտ +3R
-
-    Չեն ներառվում slippage-ը և funding-ը։
-    """
-
     if signal not in ("LONG", "SHORT"):
         return None
 
@@ -338,23 +325,23 @@ def calculate_levels(signal, entry, atr):
 
     if not 0 <= FEE_RATE < 0.1:
         raise ValueError(
-            "FUTURES_FEE_RATE-ը ստուգիր։ "
-            "Օրինակ՝ 0.0005 նշանակում է 0.05%։"
+            "Invalid FUTURES_FEE_RATE. "
+            "Example: 0.0005 means 0.05% per side."
         )
 
-    distance = ATR_MULTIPLIER * atr
+    sl_distance = ATR_MULTIPLIER * atr
     fee = FEE_RATE
 
     if signal == "LONG":
-        sl = entry - distance
+        sl = entry - sl_distance
 
         if sl <= 0:
             return None
 
-        # SL-ի զուտ կորուստը՝ մեկ միավորի հաշվով։
+        # Net loss per unit at SL, including entry/exit fees.
         net_risk = (entry - sl) + fee * (entry + sl)
 
-        # Զուտ շահույթը TP-ում = R բազմապատիկ։
+        # Net target profit equals R multiple.
         tp1 = (
             entry * (1 + fee) + TP1_R * net_risk
         ) / (1 - fee)
@@ -364,7 +351,7 @@ def calculate_levels(signal, entry, atr):
         ) / (1 - fee)
 
     else:
-        sl = entry + distance
+        sl = entry + sl_distance
 
         net_risk = (sl - entry) + fee * (entry + sl)
 
@@ -386,17 +373,15 @@ def calculate_levels(signal, entry, atr):
 
 
 # ==================================================
-# ԱՅԺՄՅԱՆ ԱԶԴԱՆՇԱՆԻ ՎԵՐԼՈՒԾՈՒԹՅՈՒՆ
+# ANALYZE CURRENT MARKET
 # ==================================================
 
 def analyze():
-    m15 = get_closed_candles("15m", limit=200)
-    h1 = get_closed_candles("1h", limit=200)
+    m15 = get_closed_candles("15m", 200)
+    h1 = get_closed_candles("1h", 200)
 
     if len(m15) < 40 or len(h1) < 40:
-        raise ValueError(
-            "Բավարար փակված մոմեր չկան։ Փորձիր մի փոքր ուշ։"
-        )
+        raise ValueError("Not enough closed candles from Gate")
 
     m15 = indicators(m15)
     h1 = indicators(h1)
@@ -459,19 +444,18 @@ def format_signal(data):
             f"TP1՝ {data['tp1']:.2f} (զուտ 2R)",
             f"TP2՝ {data['tp2']:.2f} (զուտ 3R)",
             "",
-            "TP1-ում փակել դիրքի 50%-ը՝ ըստ ռազմավարության։",
-            "TP2-ը նախատեսված է մնացած 50%-ի համար։",
+            "Ռազմավարություն՝ TP1-ում փակել 50%, "
+            "TP2-ում՝ մնացած 50%-ը։",
         ])
     else:
         lines.extend([
             "",
-            "Հիմա պայմանները չեն համընկնում։",
-            "Մի բացիր գործարք միայն ազդանշան ստանալու համար։",
+            "Պայմանները չեն համընկնում։ NO TRADE։",
         ])
 
     lines.extend([
         "",
-        "Տվյալները Gate USDT Futures-ից են։",
+        "Gate USDT Futures տվյալներ։",
         "Բոտը պատվերներ չի տեղադրում։",
     ])
 
@@ -479,23 +463,21 @@ def format_signal(data):
 
 
 # ==================================================
-# TELEGRAM ՀՐԱՄԱՆՆԵՐ
+# TELEGRAM COMMANDS
 # ==================================================
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    chat_id = update.effective_chat.id
-    CHAT_IDS.add(chat_id)
+    CHAT_IDS.add(update.effective_chat.id)
 
     await update.message.reply_text(
         "Bot is working!\n\n"
-        "Հրամաններ՝\n"
         "/signal — ընթացիկ վերլուծություն\n"
         "/backtest 30 — վերջին 30 օրվա բեքթեստ\n\n"
-        "Բոտը կարող է նաև ուղարկել նոր LONG/SHORT "
-        "ազդանշաններ։ Այն ինքնուրույն գործարք չի բացում։"
+        "Բոտը ազդանշաններ է ուղարկում, "
+        "բայց ինքնուրույն գործարք չի բացում։"
     )
 
 
@@ -513,13 +495,13 @@ async def signal_command(
     except Exception as exc:
         logger.exception("Signal analysis failed")
         await update.message.reply_text(
-            "Վերլուծության սխալ։ Փորձիր կրկին։\n"
-            f"Պատճառը՝ {str(exc)[:250]}"
+            "Վերլուծության սխալ։\n"
+            f"{str(exc)[:300]}"
         )
 
 
 # ==================================================
-# ԲԵՔԹԵՍՏ
+# BACKTEST
 # ==================================================
 
 def run_backtest(days=30):
@@ -528,7 +510,7 @@ def run_backtest(days=30):
     now = int(time.time())
     target_start = now - days * 86400
 
-    # Լրացուցիչ պատմություն՝ EMA-ների հաշվարկի համար։
+    # Extra candles warm up EMA and ATR.
     history_days = days + 10
 
     m15 = fetch_history("15m", history_days)
@@ -536,17 +518,14 @@ def run_backtest(days=30):
 
     if len(m15) < 100 or len(h1) < 40:
         return (
-            "Բավարար պատմական տվյալներ չկան։ "
-            "Փորձիր ավելի ուշ։"
+            "Բավարար պատմական մոմեր չկան։ "
+            "Փորձիր կրկին կամ ստուգիր Gate API-ն։"
         )
 
     m15 = indicators(m15)
     h1 = indicators(h1)
 
-    # 15m ազդանշանը հայտնի է մոմի փակվելուց հետո։
     m15["signal_time"] = m15["time"] + 900
-
-    # 1h EMA-ները հասանելի են միայն ժամային մոմի փակումից հետո։
     h1["hour_close_time"] = h1["time"] + 3600
 
     hour_data = h1[
@@ -602,7 +581,6 @@ def run_backtest(days=30):
         sl = levels["sl"]
         tp1 = levels["tp1"]
         tp2 = levels["tp2"]
-        net_risk = levels["net_risk"]
 
         first_tp_hit = False
         outcome_r = None
@@ -610,7 +588,6 @@ def run_backtest(days=30):
 
         for j in range(i + 1, len(merged)):
             candle = merged.iloc[j]
-
             high = float(candle["high"])
             low = float(candle["low"])
 
@@ -623,12 +600,10 @@ def run_backtest(days=30):
                 tp1_hit = low <= tp1
                 tp2_hit = low <= tp2
 
-            # Եթե նույն մոմում SL և TP են հատվել,
-            # պահպանողական հաշվարկով SL-ը նախորդում է։
+            # Conservative assumption if SL and TP are
+            # both touched in the same candle.
             if sl_hit:
                 if first_tp_hit:
-                    # 50%-ը TP1-ում փակվել է,
-                    # մնացած 50%-ը՝ SL-ում։
                     outcome_r = (
                         TP1_R * TP1_CLOSE_PERCENT
                         - (1 - TP1_CLOSE_PERCENT)
@@ -640,7 +615,6 @@ def run_backtest(days=30):
                 break
 
             if tp2_hit:
-                # Կեսը՝ TP1-ում, կեսը՝ TP2-ում։
                 outcome_r = (
                     TP1_R * TP1_CLOSE_PERCENT
                     + TP2_R * (1 - TP1_CLOSE_PERCENT)
@@ -651,11 +625,11 @@ def run_backtest(days=30):
             if tp1_hit and not first_tp_hit:
                 first_tp_hit = True
 
-        # Չփակված գործարքը չենք հաշվում որպես ավարտված։
+        # Ignore trades still open at the end of history.
         if exit_index is None:
             break
 
-        risk_pct = (net_risk / entry) * 100
+        risk_pct = levels["net_risk"] / entry * 100
         net_pct = outcome_r * risk_pct
 
         trades.append({
@@ -664,21 +638,17 @@ def run_backtest(days=30):
             "net_pct": net_pct,
         })
 
-        # Նոր գործարք՝ միայն նախորդի ավարտից հետո։
         i = exit_index + 1
 
     if not trades:
         return (
-            f"Բեքթեստ՝ {days} օր\n"
-            "Ավարտված գործարքներ չեն գտնվել։\n"
-            "Սա չի նշանակում, որ ռազմավարությունը շահութաբեր է "
-            "կամ անշահավետ․ ստուգիր տվյալները և պայմանները։"
+            f"BTC/USDT Futures — Բեքթեստ {days} օր\n"
+            "Ավարտված գործարքներ չեն գտնվել։"
         )
 
     total = len(trades)
     wins = sum(t["outcome_r"] > 0 for t in trades)
     losses = sum(t["outcome_r"] < 0 for t in trades)
-
     longs = sum(t["signal"] == "LONG" for t in trades)
     shorts = sum(t["signal"] == "SHORT" for t in trades)
 
@@ -695,10 +665,9 @@ def run_backtest(days=30):
         f"Ընդհանուր արդյունք՝ {total_r:+.2f}R\n"
         f"Գործարքների տոկոսների գումար՝ {total_pct:+.2f}%\n\n"
         "TP1-ում փակվում է 50%, TP2-ում՝ մնացած 50%-ը։\n"
-        "Կոմիսիան ներառված է մոտավոր հաշվարկում։\n"
-        "Չեն ներառվում slippage-ը, funding-ը և կապիտալի "
-        "բարդ տոկոսադրույքով աճը։\n"
-        "Անցյալի արդյունքը ապագա շահույթ չի երաշխավորում։"
+        "Կոմիսիան մոտավոր հաշվարկված է։\n"
+        "Slippage-ը և funding-ը ներառված չեն։\n"
+        "Սա պատմական թեստ է, շահույթի երաշխիք չէ։"
     )
 
 
@@ -720,25 +689,22 @@ async def backtest_command(
     days = max(7, min(days, 90))
 
     await update.message.reply_text(
-        f"Հաշվում եմ վերջին {days} օրվա բեքթեստը։ "
-        "Սա կարող է մի փոքր ժամանակ տևել..."
+        f"Հաշվում եմ վերջին {days} օրվա բեքթեստը..."
     )
 
     try:
-        result = await asyncio.to_thread(
-            run_backtest, days
-        )
+        result = await asyncio.to_thread(run_backtest, days)
         await update.message.reply_text(result)
     except Exception as exc:
         logger.exception("Backtest failed")
         await update.message.reply_text(
-            "Բեքթեստի ժամանակ սխալ առաջացավ։\n"
-            f"Պատճառը՝ {str(exc)[:250]}"
+            "Բեքթեստի սխալ։\n"
+            f"{str(exc)[:300]}"
         )
 
 
 # ==================================================
-# ԱՎՏՈՄԱՏ ԱԶԴԱՆՇԱՆՆԵՐ
+# AUTOMATIC SIGNAL ALERTS
 # ==================================================
 
 async def periodic_alerts(app: Application):
@@ -750,17 +716,13 @@ async def periodic_alerts(app: Application):
             candle_time = data["candle_time"]
 
             if LAST_ALERT_CANDLE is None:
-                # Սկզբում չենք ուղարկում հին ազդանշանը։
                 LAST_ALERT_CANDLE = candle_time
 
             elif candle_time != LAST_ALERT_CANDLE:
                 LAST_ALERT_CANDLE = candle_time
 
                 if data["signal"] in ("LONG", "SHORT"):
-                    message = (
-                        "ՆՈՐ ԱԶԴԱՆՇԱՆ\n\n"
-                        + format_signal(data)
-                    )
+                    message = "ՆՈՐ ԱԶԴԱՆՇԱՆ\n\n" + format_signal(data)
 
                     for chat_id in list(CHAT_IDS):
                         try:
@@ -770,8 +732,7 @@ async def periodic_alerts(app: Application):
                             )
                         except Exception:
                             logger.exception(
-                                "Telegram send failed for %s",
-                                chat_id,
+                                "Telegram message failed"
                             )
 
         except Exception:
@@ -785,14 +746,14 @@ async def post_init(app: Application):
 
 
 # ==================================================
-# ՄԵԿՆԱՐԿ
+# START
 # ==================================================
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN-ը սահմանված չէ։ "
-            "Ավելացրու այն Fadehost-ի Environment Variables-ում։"
+            "Ավելացրու այն Fadehost Environment Variables-ում։"
         )
 
     if not 0 <= FEE_RATE < 0.1:
@@ -808,15 +769,9 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("start", start_command)
-    )
-    app.add_handler(
-        CommandHandler("signal", signal_command)
-    )
-    app.add_handler(
-        CommandHandler("backtest", backtest_command)
-    )
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("signal", signal_command))
+    app.add_handler(CommandHandler("backtest", backtest_command))
 
     logger.info("BTC/USDT Futures bot starting...")
     app.run_polling()
