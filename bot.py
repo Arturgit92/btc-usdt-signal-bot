@@ -317,6 +317,17 @@ def determine_signal(prev, cur, hour):
 # ==================================================
 
 def calculate_levels(signal, entry, atr):
+    """
+    SL: ATR * 1.5
+    TP1: առնվազն զուտ +0.4% և 2R
+    TP2: առնվազն զուտ +0.4% և 3R
+
+    Կոմիսիան հաշվարկվում է մուտքի և ելքի համար։
+    Funding-ը և slippage-ը ներառված չեն։
+    """
+
+    MIN_NET_PROFIT_PCT = 0.004  # 0.4%
+
     if signal not in ("LONG", "SHORT"):
         return None
 
@@ -324,13 +335,10 @@ def calculate_levels(signal, entry, atr):
         return None
 
     if not 0 <= FEE_RATE < 0.1:
-        raise ValueError(
-            "Invalid FUTURES_FEE_RATE. "
-            "Example: 0.0005 means 0.05% per side."
-        )
+        raise ValueError("Ստուգիր FUTURES_FEE_RATE-ը։")
 
-    sl_distance = ATR_MULTIPLIER * atr
     fee = FEE_RATE
+    sl_distance = ATR_MULTIPLIER * atr
 
     if signal == "LONG":
         sl = entry - sl_distance
@@ -338,30 +346,50 @@ def calculate_levels(signal, entry, atr):
         if sl <= 0:
             return None
 
-        # Net loss per unit at SL, including entry/exit fees.
         net_risk = (entry - sl) + fee * (entry + sl)
 
-        # Net target profit equals R multiple.
-        tp1 = (
+        # Գին, որի դեպքում զուտ շահույթը entry-ի 0.4%-ն է։
+        min_profit_tp = (
+            entry * (1 + fee)
+            + entry * MIN_NET_PROFIT_PCT
+        ) / (1 - fee)
+
+        tp1_2r = (
             entry * (1 + fee) + TP1_R * net_risk
         ) / (1 - fee)
 
-        tp2 = (
+        tp2_3r = (
             entry * (1 + fee) + TP2_R * net_risk
         ) / (1 - fee)
 
-    else:
+        # LONG-ի դեպքում ավելի բարձր TP է պետք։
+        tp1 = max(tp1_2r, min_profit_tp)
+        tp2 = max(tp2_3r, min_profit_tp)
+
+    else:  # SHORT
         sl = entry + sl_distance
 
         net_risk = (sl - entry) + fee * (entry + sl)
 
-        tp1 = (
+        min_profit_tp = (
+            entry * (1 - fee)
+            - entry * MIN_NET_PROFIT_PCT
+        ) / (1 + fee)
+
+        tp1_2r = (
             entry * (1 - fee) - TP1_R * net_risk
         ) / (1 + fee)
 
-        tp2 = (
+        tp2_3r = (
             entry * (1 - fee) - TP2_R * net_risk
         ) / (1 + fee)
+
+        # SHORT-ի դեպքում ավելի ցածր TP է պետք։
+        tp1 = min(tp1_2r, min_profit_tp)
+        tp2 = min(tp2_3r, min_profit_tp)
+
+    if tp1 <= 0 or tp2 <= 0:
+        return None
 
     return {
         "entry": entry,
@@ -370,6 +398,7 @@ def calculate_levels(signal, entry, atr):
         "tp2": tp2,
         "net_risk": net_risk,
     }
+
 
 
 # ==================================================
