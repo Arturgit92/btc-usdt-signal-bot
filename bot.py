@@ -3,6 +3,7 @@ import os
 import time
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import requests
 import pandas as pd
@@ -13,201 +14,173 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ==================================================
-# SETTINGS
-# ==================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-GATE_URL = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+GATE_URL = (
+    "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+)
 CONTRACT = "BTC_USDT"
 
-# One-side futures fee. 0.0005 = 0.05%.
-# Set FUTURES_FEE_RATE in Fadehost to your actual rate.
 FEE_RATE = float(os.getenv("FUTURES_FEE_RATE", "0.0005"))
-
 ATR_MULTIPLIER = 1.5
+
 TP1_R = 2.0
 TP2_R = 3.0
 TP1_CLOSE_PERCENT = 0.50
+MIN_NET_TP1_PCT = 0.004
 
-POLL_SECONDS = 60
-
-CANDLE_SECONDS = {
-    "15m": 900,
-    "1h": 3600,
-}
+AUTO_CHECK_SECONDS = 60
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-CHAT_IDS = set()
-LAST_ALERT_CANDLE = None
+http = requests.Session()
+http.headers.update({"User-Agent": "BTC-USDT-Signal-Bot/1.0"})
+
+subscribed_chats = set()
+last_alert_candle = None
 
 
-# ==================================================
-# GATE FUTURES DATA
-# ==================================================
+# =========================================================
+# HTTP AND GATE DATA
+# =========================================================
 
-def request_candles(interval, limit=200, start=None, end=None):
-    params = {
-        "contract": CONTRACT,
-        "interval": interval,
-    }
-
-    # IMPORTANT:
-    # Gate historical requests use from/to.
-    # Do not send limit with from/to.
-    if start is not None or end is not None:
-        if start is not None:
-            params["from"] = int(start)
-        if end is not None:
-            params["to"] = int(end)
-    else:
-        params["limit"] = min(int(limit), 1000)
-
-    response = requests.get(
-        GATE_URL,
+def get_json(url, params=None, timeout=20):
+    response = http.get(
+        url,
         params=params,
-        timeout=20,
+        timeout=timeout,
     )
+    response.raise_for_status()
+    return response.json()
 
-    if not response.ok:
-        raise RuntimeError(
-            f"Gate API error {response.status_code}: "
-            f"{response.text[:400]}"
-        )
 
-    rows = response.json()
+def normalize_candles(data):
+    rows = []
 
-    if not isinstance(rows, list):
-        raise ValueError("Gate API returned unexpected data")
-
-    parsed = []
-
-    for row in rows:
-        try:
-            parsed.append({
-                "time": int(row["t"]),
-                "open": float(row["o"]),
-                "high": float(row["h"]),
-                "low": float(row["l"]),
-                "close": float(row["c"]),
-                "volume": float(row.get("v", 0)),
+    for item in data:
+        if isinstance(item, dict):
+            rows.append({
+                "time": int(item.get("t", item.get("time", 0))),
+                "open": float(item["o"]),
+                "high": float(item["h"]),
+                "low": float(item["l"]),
+                "close": float(item["c"]),
+                "volume": float(item.get("v", 0)),
             })
-        except (KeyError, TypeError, ValueError):
-            continue
 
-    if not parsed:
-        return pd.DataFrame(
-            columns=[
-                "time", "open", "high",
-                "low", "close", "volume",
-            ]
-        )
+        elif isinstance(item, (list, tuple)) and len(item) >= 6:
+            # Gate-ի սովորական futures candle list-ի հերթականությունը:
+            # time, volume, close, high, low, open
+            rows.append({
+                "time": int(item[0]),
+                "volume": float(item[1]),
+                "close": float(item[2]),
+                "high": float(item[3]),
+                "low": float(item[4]),
+                "open": float(item[5]),
+            })
 
-    df = pd.DataFrame(parsed)
-    df = df.drop_duplicates(subset=["time"])
-    return df.sort_values("time").reset_index(drop=True)
-
-
-def get_closed_candles(interval, limit=200):
-    df = request_candles(interval, limit=limit)
+    df = pd.DataFrame(rows)
 
     if df.empty:
-        return df
+        raise ValueError("Gate API-ն մոմեր չի վերադարձրել։")
 
-    now = int(time.time())
-    seconds = CANDLE_SECONDS[interval]
+    df = (
+        df.drop_duplicates(subset=["time"])
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
 
-    # Exclude the currently forming candle.
-    df = df[df["time"] + seconds <= now]
-
-    return df.reset_index(drop=True)
+    return df
 
 
-def fetch_history(interval, days):
-    """Download historical candles in time chunks."""
-    seconds = CANDLE_SECONDS[interval]
-    now = int(time.time())
+def request_candles(interval="15m", limit=200):
+    """Վերջին մոմերը՝ ընթացիկ ազդանշանի համար."""
 
-    start_time = now - int(days * 86400)
-    cursor = start_time
-    all_frames = []
+    data = get_json(
+        GATE_URL,
+        params={
+            "contract": CONTRACT,
+            "interval": interval,
+            "limit": limit,
+        },
+    )
 
-    while cursor < now:
+    return normalize_candles(data)
+
+
+def request_candles_range(start_ts, end_ts, interval):
+    """
+    Պատմական մոմերը վերցնում է փոքր ժամանակահատվածներով։
+    from/to-ի հետ limit չի ուղարկվում։
+    """
+
+    chunk_seconds = 5 * 24 * 60 * 60
+    all_data = []
+    chunk_start = int(start_ts)
+
+    while chunk_start < end_ts:
         chunk_end = min(
-            now,
-            cursor + seconds * 999,
+            chunk_start + chunk_seconds,
+            int(end_ts),
         )
 
-        df = request_candles(
-            interval,
-            start=cursor,
-            end=chunk_end,
+        data = get_json(
+            GATE_URL,
+            params={
+                "contract": CONTRACT,
+                "interval": interval,
+                "from": chunk_start,
+                "to": chunk_end,
+            },
         )
 
-        if df.empty:
-            cursor = chunk_end + seconds
-            continue
+        if not isinstance(data, list):
+            raise ValueError(
+                f"Gate API-ի անսպասելի պատասխանը՝ {data}"
+            )
 
-        df = df[
-            (df["time"] >= cursor)
-            & (df["time"] <= chunk_end)
-            & (df["time"] + seconds <= now)
-        ]
+        all_data.extend(data)
 
-        if df.empty:
-            cursor = chunk_end + seconds
-            continue
+        # Հաջորդ հարցումը սկսվում է հաջորդ վայրկյանից։
+        chunk_start = chunk_end + 1
+        time.sleep(0.15)
 
-        all_frames.append(df)
-
-        latest_time = int(df["time"].max())
-        next_cursor = latest_time + seconds
-
-        # Prevent getting stuck if the API returns old candles.
-        if next_cursor <= cursor:
-            cursor = chunk_end + seconds
-        else:
-            cursor = next_cursor
-
-        time.sleep(0.08)
-
-    if not all_frames:
-        return pd.DataFrame(
-            columns=[
-                "time", "open", "high",
-                "low", "close", "volume",
-            ]
+    if not all_data:
+        raise ValueError(
+            f"Gate-ը {interval} ժամանակահատվածի մոմեր չի վերադարձրել։"
         )
 
-    result = pd.concat(all_frames, ignore_index=True)
-    result = result.drop_duplicates(subset=["time"])
-    result = result.sort_values("time").reset_index(drop=True)
-
-    return result
+    return normalize_candles(all_data)
 
 
-# ==================================================
+# =========================================================
 # INDICATORS
-# ==================================================
+# =========================================================
 
-def indicators(df):
+def add_indicators(df):
     df = df.copy()
 
     df["ema9"] = df["close"].ewm(
-        span=9, adjust=False
+        span=9,
+        adjust=False,
     ).mean()
 
     df["ema21"] = df["close"].ewm(
-        span=21, adjust=False
+        span=21,
+        adjust=False,
     ).mean()
 
     delta = df["close"].diff()
+
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -226,25 +199,18 @@ def indicators(df):
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    df.loc[
-        (avg_loss == 0) & (avg_gain > 0), "rsi"
-    ] = 100
+    previous_close = df["close"].shift(1)
 
-    df.loc[
-        (avg_gain == 0) & (avg_loss > 0), "rsi"
-    ] = 0
-
-    prev_close = df["close"].shift(1)
-
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-
-    true_range = pd.concat(
-        [tr1, tr2, tr3], axis=1
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - previous_close).abs(),
+            (df["low"] - previous_close).abs(),
+        ],
+        axis=1,
     ).max(axis=1)
 
-    df["atr"] = true_range.ewm(
+    df["atr"] = tr.ewm(
         alpha=1 / 14,
         min_periods=14,
         adjust=False,
@@ -253,80 +219,20 @@ def indicators(df):
     return df
 
 
-# ==================================================
-# SIGNAL RULES
-# ==================================================
-
-def determine_signal(prev, cur, hour):
-    values = [
-        prev.get("ema9"),
-        prev.get("ema21"),
-        cur.get("ema9"),
-        cur.get("ema21"),
-        cur.get("rsi"),
-        hour.get("ema9"),
-        hour.get("ema21"),
-    ]
-
-    if any(pd.isna(v) for v in values):
-        return "NO TRADE"
-
-    cross_up = (
-        prev["ema9"] <= prev["ema21"]
-        and cur["ema9"] > cur["ema21"]
-    )
-
-    cross_down = (
-        prev["ema9"] >= prev["ema21"]
-        and cur["ema9"] < cur["ema21"]
-    )
-
-    reclaim_long = (
-        prev["close"] <= prev["ema9"]
-        and cur["close"] > cur["ema9"]
-        and cur["ema9"] > cur["ema21"]
-    )
-
-    reclaim_short = (
-        prev["close"] >= prev["ema9"]
-        and cur["close"] < cur["ema9"]
-        and cur["ema9"] < cur["ema21"]
-    )
-
-    rsi = cur["rsi"]
-
-    if (
-        hour["ema9"] > hour["ema21"]
-        and 45 < rsi < 68
-        and (cross_up or reclaim_long)
-    ):
-        return "LONG"
-
-    if (
-        hour["ema9"] < hour["ema21"]
-        and 32 < rsi < 55
-        and (cross_down or reclaim_short)
-    ):
-        return "SHORT"
-
-    return "NO TRADE"
-
-
-# ==================================================
-# ATR STOP LOSS AND NET R TARGETS
-# ==================================================
+# =========================================================
+# SL / TP CALCULATION
+# =========================================================
 
 def calculate_levels(signal, entry, atr):
     """
-    SL: ATR * 1.5
-    TP1: առնվազն զուտ +0.4% և 2R
-    TP2: առնվազն զուտ +0.4% և 3R
+    TP1-ի մոտավոր զուտ թիրախը՝ առնվազն 0.4%,
+    կամ 2R՝ որն ավելի հեռու է։
 
-    Կոմիսիան հաշվարկվում է մուտքի և ելքի համար։
-    Funding-ը և slippage-ը ներառված չեն։
+    TP2-ը՝ առնվազն 3R և TP1-ից ավելի հեռու։
+
+    R-ի չափման հիմքը սկզբնական գնի ռիսկն է՝ entry-ից SL։
+    Մաքուր արդյունքի հաշվարկում ներառվում են մուտքի ու ելքի վճարները։
     """
-
-    MIN_NET_PROFIT_PCT = 0.004  # 0.4%
 
     if signal not in ("LONG", "SHORT"):
         return None
@@ -335,60 +241,49 @@ def calculate_levels(signal, entry, atr):
         return None
 
     if not 0 <= FEE_RATE < 0.1:
-        raise ValueError("Ստուգիր FUTURES_FEE_RATE-ը։")
+        raise ValueError("FUTURES_FEE_RATE-ի արժեքը սխալ է։")
 
-    fee = FEE_RATE
-    sl_distance = ATR_MULTIPLIER * atr
+    risk_distance = ATR_MULTIPLIER * atr
 
     if signal == "LONG":
-        sl = entry - sl_distance
+        sl = entry - risk_distance
 
         if sl <= 0:
             return None
 
-        net_risk = (entry - sl) + fee * (entry + sl)
+        # Լուծում ենք՝ exit-entry-fee*(entry+exit) = entry*0.004
+        min_tp1 = (
+            entry * (1 + FEE_RATE + MIN_NET_TP1_PCT)
+            / (1 - FEE_RATE)
+        )
 
-        # Գին, որի դեպքում զուտ շահույթը entry-ի 0.4%-ն է։
-        min_profit_tp = (
-            entry * (1 + fee)
-            + entry * MIN_NET_PROFIT_PCT
-        ) / (1 - fee)
+        tp1_2r = entry + TP1_R * risk_distance
+        tp1 = max(tp1_2r, min_tp1)
 
-        tp1_2r = (
-            entry * (1 + fee) + TP1_R * net_risk
-        ) / (1 - fee)
+        tp2_3r = entry + TP2_R * risk_distance
+        tp2 = max(
+            tp2_3r,
+            tp1 + entry * MIN_NET_TP1_PCT,
+        )
 
-        tp2_3r = (
-            entry * (1 + fee) + TP2_R * net_risk
-        ) / (1 - fee)
+    else:
+        sl = entry + risk_distance
 
-        # LONG-ի դեպքում ավելի բարձր TP է պետք։
-        tp1 = max(tp1_2r, min_profit_tp)
-        tp2 = max(tp2_3r, min_profit_tp)
+        min_tp1 = (
+            entry * (1 - FEE_RATE - MIN_NET_TP1_PCT)
+            / (1 + FEE_RATE)
+        )
 
-    else:  # SHORT
-        sl = entry + sl_distance
+        tp1_2r = entry - TP1_R * risk_distance
+        tp1 = min(tp1_2r, min_tp1)
 
-        net_risk = (sl - entry) + fee * (entry + sl)
+        tp2_3r = entry - TP2_R * risk_distance
+        tp2 = min(
+            tp2_3r,
+            tp1 - entry * MIN_NET_TP1_PCT,
+        )
 
-        min_profit_tp = (
-            entry * (1 - fee)
-            - entry * MIN_NET_PROFIT_PCT
-        ) / (1 + fee)
-
-        tp1_2r = (
-            entry * (1 - fee) - TP1_R * net_risk
-        ) / (1 + fee)
-
-        tp2_3r = (
-            entry * (1 - fee) - TP2_R * net_risk
-        ) / (1 + fee)
-
-        # SHORT-ի դեպքում ավելի ցածր TP է պետք։
-        tp1 = min(tp1_2r, min_profit_tp)
-        tp2 = min(tp2_3r, min_profit_tp)
-
-    if tp1 <= 0 or tp2 <= 0:
+    if min(sl, tp1, tp2) <= 0:
         return None
 
     return {
@@ -396,117 +291,362 @@ def calculate_levels(signal, entry, atr):
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "net_risk": net_risk,
+        "risk_distance": risk_distance,
     }
 
 
+# =========================================================
+# SIGNAL CONDITIONS
+# =========================================================
 
-# ==================================================
-# ANALYZE CURRENT MARKET
-# ==================================================
+def signal_for_closed_candle(df15, df1h, index):
+    """
+    Օգտագործում է միայն արդեն փակված 15m և 1h մոմերը։
+    index-ը այն 15m մոմի դիրքն է, որտեղից սկսվում է մուտքի ստուգումը։
+    """
 
-def analyze():
-    m15 = get_closed_candles("15m", 200)
-    h1 = get_closed_candles("1h", 200)
+    signal_idx = index - 1
 
-    if len(m15) < 40 or len(h1) < 40:
-        raise ValueError("Not enough closed candles from Gate")
+    if signal_idx < 0:
+        return None
 
-    m15 = indicators(m15)
-    h1 = indicators(h1)
+    candle = df15.iloc[signal_idx]
+    signal_time = int(candle["time"])
 
-    prev = m15.iloc[-2]
-    cur = m15.iloc[-1]
-    hour = h1.iloc[-1]
+    # Ընտրում ենք միայն այն 1h մոմերը, որոնք փակված են
+    # ազդանշանի մոմի փակման պահին։
+    signal_close_time = signal_time + 15 * 60
 
-    signal = determine_signal(prev, cur, hour)
+    closed_1h = df1h[
+        df1h["time"] + 60 * 60 <= signal_close_time
+    ]
 
-    entry = float(cur["close"])
-    atr = float(cur["atr"])
+    if closed_1h.empty:
+        return None
+
+    h1 = closed_1h.iloc[-1]
+
+    required = [
+        candle["ema9"],
+        candle["ema21"],
+        candle["rsi"],
+        candle["atr"],
+        h1["ema9"],
+        h1["ema21"],
+    ]
+
+    if any(pd.isna(value) for value in required):
+        return None
+
+    long_condition = (
+        candle["ema9"] > candle["ema21"]
+        and h1["ema9"] > h1["ema21"]
+        and 50 <= candle["rsi"] <= 68
+    )
+
+    short_condition = (
+        candle["ema9"] < candle["ema21"]
+        and h1["ema9"] < h1["ema21"]
+        and 32 <= candle["rsi"] <= 50
+    )
+
+    if long_condition:
+        side = "LONG"
+    elif short_condition:
+        side = "SHORT"
+    else:
+        return None
+
+    return {
+        "side": side,
+        "signal_time": signal_time,
+        "rsi": float(candle["rsi"]),
+        "ema9": float(candle["ema9"]),
+        "ema21": float(candle["ema21"]),
+        "atr": float(candle["atr"]),
+    }
+
+
+def analyze_current_market():
+    df15 = add_indicators(request_candles("15m", 200))
+    df1h = add_indicators(request_candles("1h", 200))
+
+    # Վերջին մոմը կարող է դեռ չփակված լինել։
+    idx = len(df15) - 1
+
+    if idx < 30:
+        raise ValueError("15m տվյալները բավարար չեն։")
+
+    candle = df15.iloc[-2]
+
+    signal = signal_for_closed_candle(df15, df1h, idx)
 
     result = {
-        "signal": signal,
-        "entry": entry,
-        "rsi": float(cur["rsi"]),
-        "ema9_15": float(cur["ema9"]),
-        "ema21_15": float(cur["ema21"]),
-        "ema9_1h": float(hour["ema9"]),
-        "ema21_1h": float(hour["ema21"]),
-        "atr": atr,
-        "candle_time": int(cur["time"]),
+        "side": signal["side"] if signal else "NO TRADE",
+        "price": float(candle["close"]),
+        "rsi": float(candle["rsi"]),
+        "ema9": float(candle["ema9"]),
+        "ema21": float(candle["ema21"]),
+        "candle_time": int(candle["time"]),
+        "reason": (
+            "Պայմանները չեն հաստատվել"
+            if signal is None else ""
+        ),
     }
 
-    if signal in ("LONG", "SHORT"):
-        levels = calculate_levels(signal, entry, atr)
+    if signal:
+        levels = calculate_levels(
+            signal["side"],
+            result["price"],
+            signal["atr"],
+        )
 
         if levels is None:
-            result["signal"] = "NO TRADE"
+            result["side"] = "NO TRADE"
+            result["reason"] = "SL/TP մակարդակները հաշվարկել չհաջողվեց։"
         else:
             result.update(levels)
 
     return result
 
 
-def format_signal(data):
-    lines = [
-        f"BTC/USDT Futures — {data['signal']}",
-        f"Մուտք՝ {data['entry']:.2f} USDT",
-        f"RSI (15m)՝ {data['rsi']:.2f}",
-        (
-            f"EMA 9/21 (15m)՝ "
-            f"{data['ema9_15']:.2f} / "
-            f"{data['ema21_15']:.2f}"
-        ),
-        (
-            f"EMA 9/21 (1h)՝ "
-            f"{data['ema9_1h']:.2f} / "
-            f"{data['ema21_1h']:.2f}"
-        ),
-        f"ATR (15m)՝ {data['atr']:.2f}",
-        f"Կոմիսիա՝ {FEE_RATE * 100:.4f}% մեկ կողմի համար",
-    ]
+# =========================================================
+# BACKTEST
+# =========================================================
 
-    if data["signal"] in ("LONG", "SHORT"):
-        lines.extend([
-            "",
-            f"SL՝ {data['sl']:.2f}",
-            f"TP1՝ {data['tp1']:.2f} (զուտ 2R)",
-            f"TP2՝ {data['tp2']:.2f} (զուտ 3R)",
-            "",
-            "Ռազմավարություն՝ TP1-ում փակել 50%, "
-            "TP2-ում՝ մնացած 50%-ը։",
-        ])
+def net_pnl_per_unit(side, entry, exit_price):
+    """Մեկ միավորի զուտ PnL՝ մուտքի և ելքի վճարներով։"""
+
+    if side == "LONG":
+        gross = exit_price - entry
     else:
-        lines.extend([
-            "",
-            "Պայմանները չեն համընկնում։ NO TRADE։",
-        ])
+        gross = entry - exit_price
 
-    lines.extend([
-        "",
-        "Gate USDT Futures տվյալներ։",
-        "Բոտը պատվերներ չի տեղադրում։",
-    ])
-
-    return "\n".join(lines)
+    fees = FEE_RATE * (entry + exit_price)
+    return gross - fees
 
 
-# ==================================================
+def simulate_trade(df15, start_index, side, entry, levels):
+    """
+    Գործարքը ստուգում է ապագա մոմերով։
+    Եթե նույն մոմում SL և TP են հասնում, նախընտրում է SL-ը։
+    TP1-ում փակում է 50%, TP2-ում՝ մնացած 50%-ը։
+    """
+
+    sl = levels["sl"]
+    tp1 = levels["tp1"]
+    tp2 = levels["tp2"]
+    risk = levels["risk_distance"]
+
+    first_tp_hit = False
+
+    for j in range(start_index, len(df15)):
+        candle = df15.iloc[j]
+
+        high = float(candle["high"])
+        low = float(candle["low"])
+
+        if side == "LONG":
+            sl_hit = low <= sl
+            tp1_hit = high >= tp1
+            tp2_hit = high >= tp2
+        else:
+            sl_hit = high >= sl
+            tp1_hit = low <= tp1
+            tp2_hit = low <= tp2
+
+        # Եթե SL-ն ու TP-ն նույն մոմում են՝ SL առաջինը։
+        if sl_hit:
+            if first_tp_hit:
+                pnl = (
+                    TP1_CLOSE_PERCENT
+                    * net_pnl_per_unit(side, entry, tp1)
+                    + (1 - TP1_CLOSE_PERCENT)
+                    * net_pnl_per_unit(side, entry, sl)
+                )
+            else:
+                pnl = net_pnl_per_unit(side, entry, sl)
+
+            return {
+                "exit_index": j,
+                "exit_reason": "SL_AFTER_TP1" if first_tp_hit else "SL",
+                "pnl_per_unit": pnl,
+                "R": pnl / risk,
+                "net_pct": pnl / entry * 100,
+                "tp1_hit": first_tp_hit,
+            }
+
+        if tp2_hit:
+            pnl = (
+                TP1_CLOSE_PERCENT
+                * net_pnl_per_unit(side, entry, tp1)
+                + (1 - TP1_CLOSE_PERCENT)
+                * net_pnl_per_unit(side, entry, tp2)
+            )
+
+            return {
+                "exit_index": j,
+                "exit_reason": "TP2",
+                "pnl_per_unit": pnl,
+                "R": pnl / risk,
+                "net_pct": pnl / entry * 100,
+                "tp1_hit": True,
+            }
+
+        if tp1_hit and not first_tp_hit:
+            first_tp_hit = True
+
+    # Վերջին մոմին դեռ բաց գործարքը չենք ներկայացնում որպես ավարտված։
+    return None
+
+
+def run_backtest(days=30):
+    if days < 1 or days > 365:
+        raise ValueError("Օրերի միջակայքը պետք է լինի 1-ից 365։")
+
+    now = int(time.time())
+    start = now - days * 24 * 60 * 60
+
+    # Լրացուցիչ պատմություն՝ EMA/RSI/ATR ցուցիչների տաքացման համար։
+    warmup_start = start - 5 * 24 * 60 * 60
+
+    df15 = request_candles_range(
+        warmup_start, now, "15m"
+    )
+    df1h = request_candles_range(
+        warmup_start, now, "1h"
+    )
+
+    df15 = add_indicators(df15).reset_index(drop=True)
+    df1h = add_indicators(df1h).reset_index(drop=True)
+
+    trades = []
+    i = 1
+
+    while i < len(df15) - 1:
+        entry_candle = df15.iloc[i]
+        entry_time = int(entry_candle["time"])
+
+        if entry_time < start:
+            i += 1
+            continue
+
+        # Մուտք՝ ազդանշանի մոմին հաջորդող մոմի բացման գնով։
+        signal = signal_for_closed_candle(df15, df1h, i)
+
+        if signal is None:
+            i += 1
+            continue
+
+        side = signal["side"]
+        entry = float(entry_candle["open"])
+
+        levels = calculate_levels(
+            side,
+            entry,
+            signal["atr"],
+        )
+
+        if levels is None:
+            i += 1
+            continue
+
+        outcome = simulate_trade(
+            df15,
+            i,
+            side,
+            entry,
+            levels,
+        )
+
+        if outcome is None:
+            # Բաց գործարքը ավարտվածների մեջ չենք հաշվում։
+            break
+
+        trades.append({
+            "side": side,
+            "entry_time": entry_time,
+            "entry": entry,
+            "sl": levels["sl"],
+            "tp1": levels["tp1"],
+            "tp2": levels["tp2"],
+            **outcome,
+        })
+
+        # Չենք թույլատրում մի քանի համընկնող դիրք։
+        i = outcome["exit_index"] + 1
+
+    return trades
+
+
+def format_backtest(trades, days):
+    total = len(trades)
+
+    if total == 0:
+        return (
+            f"BTC/USDT Futures — Բեքթեստ ({days} օր)\n\n"
+            "Ավարտված գործարքներ չկան։ Ստուգիր տվյալները "
+            "կամ ընտրված ժամանակահատվածը։"
+        )
+
+    longs = [t for t in trades if t["side"] == "LONG"]
+    shorts = [t for t in trades if t["side"] == "SHORT"]
+
+    winners = [t for t in trades if t["pnl_per_unit"] > 0]
+    losers = [t for t in trades if t["pnl_per_unit"] <= 0]
+
+    total_r = sum(t["R"] for t in trades)
+    total_pct = sum(t["net_pct"] for t in trades)
+    win_rate = len(winners) / total * 100
+
+    long_wins = sum(t["pnl_per_unit"] > 0 for t in longs)
+    short_wins = sum(t["pnl_per_unit"] > 0 for t in shorts)
+
+    avg_r = total_r / total
+    tp2_count = sum(t["exit_reason"] == "TP2" for t in trades)
+    sl_count = sum(t["exit_reason"] == "SL" for t in trades)
+    sl_after_tp1_count = sum(
+        t["exit_reason"] == "SL_AFTER_TP1" for t in trades
+    )
+
+    return (
+        f"BTC/USDT Futures — Բեքթեստ ({days} օր)\n\n"
+        f"Ավարտված գործարքներ՝ {total}\n"
+        f"LONG՝ {len(longs)} | SHORT՝ {len(shorts)}\n"
+        f"LONG հաղթանակներ՝ {long_wins}/{len(longs) if longs else 0}\n"
+        f"SHORT հաղթանակներ՝ {short_wins}/{len(shorts) if shorts else 0}\n\n"
+        f"Շահութաբեր՝ {len(winners)} | Կորուստով՝ {len(losers)}\n"
+        f"Հաղթանակների տոկոս՝ {win_rate:.2f}%\n"
+        f"Միջին արդյունք՝ {avg_r:+.2f}R / գործարք\n"
+        f"Ընդհանուր արդյունք՝ {total_r:+.2f}R\n"
+        f"Գործարքների տոկոսների գումար՝ {total_pct:+.2f}%\n\n"
+        f"TP2 ելքեր՝ {tp2_count}\n"
+        f"SL ելքեր՝ {sl_count}\n"
+        f"TP1-ից հետո SL՝ {sl_after_tp1_count}\n\n"
+        f"TP1-ում փակվում է 50%, TP2-ում՝ մնացած 50%-ը։\n"
+        f"Կոմիսիա՝ {FEE_RATE * 100:.3f}% մեկ կողմի համար։\n"
+        "Slippage-ը և funding-ը ներառված չեն։\n"
+        "R-ը հաշվարկվում է սկզբնական գնի ռիսկի նկատմամբ։\n"
+        "Տոկոսների գումարը հաշվի կապիտալի եկամտաբերությունը չէ։\n"
+        "Սա պատմական թեստ է, շահույթի երաշխիք չէ։"
+    )
+
+
+# =========================================================
 # TELEGRAM COMMANDS
-# ==================================================
+# =========================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    CHAT_IDS.add(update.effective_chat.id)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscribed_chats.add(update.effective_chat.id)
 
     await update.message.reply_text(
         "Bot is working!\n\n"
-        "/signal — ընթացիկ վերլուծություն\n"
-        "/backtest 30 — վերջին 30 օրվա բեքթեստ\n\n"
-        "Բոտը ազդանշաններ է ուղարկում, "
-        "բայց ինքնուրույն գործարք չի բացում։"
+        "BTC/USDT Futures ազդանշանների բոտ։\n\n"
+        "/signal — ընթացիկ ազդանշան\n"
+        "/backtest — վերջին 30 օրվա բեքթեստ\n"
+        "/backtest 7 — վերջին 7 օրվա բեքթեստ\n"
+        "/stopalerts — անջատել ավտոմատ ծանուցումները\n\n"
+        "Բոտը Gate-ում գործարքներ ինքնուրույն չի բացում։"
     )
 
 
@@ -514,190 +654,47 @@ async def signal_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text(
-        "Ստուգում եմ Gate Futures տվյալները..."
-    )
+    await update.message.reply_text("Վերլուծում եմ BTC/USDT-ը…")
 
     try:
-        data = await asyncio.to_thread(analyze)
-        await update.message.reply_text(format_signal(data))
+        s = await asyncio.to_thread(analyze_current_market)
+
+        lines = [
+            f"BTC/USDT Futures — {s['side']}",
+            f"Գին՝ {s['price']:.2f} USDT",
+            f"RSI (15m)՝ {s['rsi']:.2f}",
+            f"EMA 9 (15m)՝ {s['ema9']:.2f}",
+            f"EMA 21 (15m)՝ {s['ema21']:.2f}",
+        ]
+
+        if s["side"] in ("LONG", "SHORT"):
+            lines += [
+                "",
+                f"Entry՝ {s['entry']:.2f}",
+                f"Stop Loss՝ {s['sl']:.2f}",
+                f"TP1՝ {s['tp1']:.2f}",
+                f"TP2՝ {s['tp2']:.2f}",
+                "",
+                "TP1-ը 0.4% զուտ թիրախ է կամ 2R՝ որն ավելի հեռու է։",
+                "TP1-ում փակել 50%, TP2-ում՝ մնացած 50%-ը։",
+            ]
+        else:
+            lines.append("Պատճառ՝ " + s["reason"])
+
+        lines += [
+            "",
+            "Կոմիսիան մոտավոր հաշվարկված է։",
+            "Սա ազդանշան է, ոչ թե շահույթի երաշխիք։",
+        ]
+
+        await update.message.reply_text("\n".join(lines))
+
     except Exception as exc:
-        logger.exception("Signal analysis failed")
+        logger.exception("Signal error")
         await update.message.reply_text(
-            "Վերլուծության սխալ։\n"
-            f"{str(exc)[:300]}"
+            "Չհաջողվեց վերլուծել շուկան։\n"
+            f"Սխալ՝ {str(exc)[:300]}"
         )
-
-
-# ==================================================
-# BACKTEST
-# ==================================================
-
-def run_backtest(days=30):
-    days = max(7, min(int(days), 90))
-
-    now = int(time.time())
-    target_start = now - days * 86400
-
-    # Extra candles warm up EMA and ATR.
-    history_days = days + 10
-
-    m15 = fetch_history("15m", history_days)
-    h1 = fetch_history("1h", history_days)
-
-    if len(m15) < 100 or len(h1) < 40:
-        return (
-            "Բավարար պատմական մոմեր չկան։ "
-            "Փորձիր կրկին կամ ստուգիր Gate API-ն։"
-        )
-
-    m15 = indicators(m15)
-    h1 = indicators(h1)
-
-    m15["signal_time"] = m15["time"] + 900
-    h1["hour_close_time"] = h1["time"] + 3600
-
-    hour_data = h1[
-        ["hour_close_time", "ema9", "ema21"]
-    ].rename(columns={
-        "ema9": "ema9_1h",
-        "ema21": "ema21_1h",
-    })
-
-    merged = pd.merge_asof(
-        m15.sort_values("signal_time"),
-        hour_data.sort_values("hour_close_time"),
-        left_on="signal_time",
-        right_on="hour_close_time",
-        direction="backward",
-    )
-
-    trades = []
-    i = 1
-
-    while i < len(merged) - 1:
-        prev = merged.iloc[i - 1]
-        cur = merged.iloc[i]
-
-        if int(cur["signal_time"]) < target_start:
-            i += 1
-            continue
-
-        hour = {
-            "ema9": cur["ema9_1h"],
-            "ema21": cur["ema21_1h"],
-        }
-
-        signal = determine_signal(prev, cur, hour)
-
-        if signal == "NO TRADE":
-            i += 1
-            continue
-
-        entry = float(cur["close"])
-        atr = float(cur["atr"])
-
-        if pd.isna(atr) or atr <= 0:
-            i += 1
-            continue
-
-        levels = calculate_levels(signal, entry, atr)
-
-        if not levels:
-            i += 1
-            continue
-
-        sl = levels["sl"]
-        tp1 = levels["tp1"]
-        tp2 = levels["tp2"]
-
-        first_tp_hit = False
-        outcome_r = None
-        exit_index = None
-
-        for j in range(i + 1, len(merged)):
-            candle = merged.iloc[j]
-            high = float(candle["high"])
-            low = float(candle["low"])
-
-            if signal == "LONG":
-                sl_hit = low <= sl
-                tp1_hit = high >= tp1
-                tp2_hit = high >= tp2
-            else:
-                sl_hit = high >= sl
-                tp1_hit = low <= tp1
-                tp2_hit = low <= tp2
-
-            # Conservative assumption if SL and TP are
-            # both touched in the same candle.
-            if sl_hit:
-                if first_tp_hit:
-                    outcome_r = (
-                        TP1_R * TP1_CLOSE_PERCENT
-                        - (1 - TP1_CLOSE_PERCENT)
-                    )
-                else:
-                    outcome_r = -1.0
-
-                exit_index = j
-                break
-
-            if tp2_hit:
-                outcome_r = (
-                    TP1_R * TP1_CLOSE_PERCENT
-                    + TP2_R * (1 - TP1_CLOSE_PERCENT)
-                )
-                exit_index = j
-                break
-
-            if tp1_hit and not first_tp_hit:
-                first_tp_hit = True
-
-        # Ignore trades still open at the end of history.
-        if exit_index is None:
-            break
-
-        risk_pct = levels["net_risk"] / entry * 100
-        net_pct = outcome_r * risk_pct
-
-        trades.append({
-            "signal": signal,
-            "outcome_r": outcome_r,
-            "net_pct": net_pct,
-        })
-
-        i = exit_index + 1
-
-    if not trades:
-        return (
-            f"BTC/USDT Futures — Բեքթեստ {days} օր\n"
-            "Ավարտված գործարքներ չեն գտնվել։"
-        )
-
-    total = len(trades)
-    wins = sum(t["outcome_r"] > 0 for t in trades)
-    losses = sum(t["outcome_r"] < 0 for t in trades)
-    longs = sum(t["signal"] == "LONG" for t in trades)
-    shorts = sum(t["signal"] == "SHORT" for t in trades)
-
-    win_rate = wins / total * 100
-    total_r = sum(t["outcome_r"] for t in trades)
-    total_pct = sum(t["net_pct"] for t in trades)
-
-    return (
-        f"BTC/USDT Futures — Բեքթեստ ({days} օր)\n\n"
-        f"Ավարտված գործարքներ՝ {total}\n"
-        f"LONG՝ {longs} | SHORT՝ {shorts}\n"
-        f"Շահութաբեր՝ {wins} | Կորուստով՝ {losses}\n"
-        f"Հաղթանակների տոկոս՝ {win_rate:.2f}%\n"
-        f"Ընդհանուր արդյունք՝ {total_r:+.2f}R\n"
-        f"Գործարքների տոկոսների գումար՝ {total_pct:+.2f}%\n\n"
-        "TP1-ում փակվում է 50%, TP2-ում՝ մնացած 50%-ը։\n"
-        "Կոմիսիան մոտավոր հաշվարկված է։\n"
-        "Slippage-ը և funding-ը ներառված չեն։\n"
-        "Սա պատմական թեստ է, շահույթի երաշխիք չէ։"
-    )
 
 
 async def backtest_command(
@@ -711,49 +708,78 @@ async def backtest_command(
             days = int(context.args[0])
         except ValueError:
             await update.message.reply_text(
-                "Օգտագործիր՝ /backtest 30"
+                "Օգտագործիր /backtest կամ /backtest 30"
             )
             return
 
-    days = max(7, min(days, 90))
+    if not 1 <= days <= 365:
+        await update.message.reply_text(
+            "Օրերի քանակը պետք է լինի 1-ից 365։"
+        )
+        return
 
     await update.message.reply_text(
-        f"Հաշվում եմ վերջին {days} օրվա բեքթեստը..."
+        f"Սկսում եմ {days} օրվա բեքթեստը։ "
+        "Տվյալների ներբեռնումը կարող է տևել։"
     )
 
     try:
-        result = await asyncio.to_thread(run_backtest, days)
-        await update.message.reply_text(result)
+        trades = await asyncio.to_thread(run_backtest, days)
+        message = format_backtest(trades, days)
+        await update.message.reply_text(message)
+
     except Exception as exc:
         logger.exception("Backtest failed")
         await update.message.reply_text(
-            "Բեքթեստի սխալ։\n"
-            f"{str(exc)[:300]}"
+            "Բեքթեստը ձախողվեց։ Ստուգիր Fadehost Logs-ը։\n"
+            f"Սխալ՝ {str(exc)[:300]}"
         )
 
 
-# ==================================================
-# AUTOMATIC SIGNAL ALERTS
-# ==================================================
+async def stop_alerts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    subscribed_chats.discard(update.effective_chat.id)
 
-async def periodic_alerts(app: Application):
-    global LAST_ALERT_CANDLE
+    await update.message.reply_text(
+        "Ավտոմատ ծանուցումներն անջատված են։ "
+        "/start՝ նորից միացնելու համար։"
+    )
+
+
+# =========================================================
+# AUTOMATIC ALERTS
+# =========================================================
+
+async def auto_alert_loop(app: Application):
+    global last_alert_candle
 
     while True:
         try:
-            data = await asyncio.to_thread(analyze)
-            candle_time = data["candle_time"]
+            if subscribed_chats:
+                s = await asyncio.to_thread(analyze_current_market)
 
-            if LAST_ALERT_CANDLE is None:
-                LAST_ALERT_CANDLE = candle_time
+                if (
+                    s["side"] in ("LONG", "SHORT")
+                    and s["candle_time"] != last_alert_candle
+                ):
+                    lines = [
+                        f"BTC/USDT Futures — {s['side']}",
+                        f"Գին՝ {s['price']:.2f}",
+                        f"RSI՝ {s['rsi']:.2f}",
+                        f"Entry՝ {s['entry']:.2f}",
+                        f"SL՝ {s['sl']:.2f}",
+                        f"TP1՝ {s['tp1']:.2f}",
+                        f"TP2՝ {s['tp2']:.2f}",
+                        "",
+                        "TP1-ում՝ 50%, TP2-ում՝ մնացած 50%։",
+                        "Սա ազդանշան է, ոչ թե շահույթի երաշխիք։",
+                    ]
 
-            elif candle_time != LAST_ALERT_CANDLE:
-                LAST_ALERT_CANDLE = candle_time
+                    message = "\n".join(lines)
 
-                if data["signal"] in ("LONG", "SHORT"):
-                    message = "ՆՈՐ ԱԶԴԱՆՇԱՆ\n\n" + format_signal(data)
-
-                    for chat_id in list(CHAT_IDS):
+                    for chat_id in list(subscribed_chats):
                         try:
                             await app.bot.send_message(
                                 chat_id=chat_id,
@@ -761,35 +787,35 @@ async def periodic_alerts(app: Application):
                             )
                         except Exception:
                             logger.exception(
-                                "Telegram message failed"
+                                "Alert could not be sent to %s",
+                                chat_id,
                             )
 
-        except Exception:
-            logger.exception("Automatic alert check failed")
+                    last_alert_candle = s["candle_time"]
 
-        await asyncio.sleep(POLL_SECONDS)
+        except Exception:
+            logger.exception("Automatic signal check failed")
+
+        await asyncio.sleep(AUTO_CHECK_SECONDS)
 
 
 async def post_init(app: Application):
-    app.create_task(periodic_alerts(app))
+    app.create_task(auto_alert_loop(app))
 
 
-# ==================================================
-# START
-# ==================================================
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN-ը սահմանված չէ։ "
-            "Ավելացրու այն Fadehost Environment Variables-ում։"
+            "TELEGRAM_BOT_TOKEN-ը բացակայում է։ "
+            "Սահմանիր այն Fadehost Environment Variables-ում։"
         )
 
     if not 0 <= FEE_RATE < 0.1:
-        raise ValueError(
-            "FUTURES_FEE_RATE-ը սխալ է։ "
-            "Օրինակ՝ 0.0005 = 0.05%։"
-        )
+        raise ValueError("FUTURES_FEE_RATE-ի արժեքը սխալ է։")
 
     app = (
         Application.builder()
@@ -798,11 +824,12 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal_command))
     app.add_handler(CommandHandler("backtest", backtest_command))
+    app.add_handler(CommandHandler("stopalerts", stop_alerts))
 
-    logger.info("BTC/USDT Futures bot starting...")
+    logger.info("BTC/USDT signal bot started")
     app.run_polling()
 
 
